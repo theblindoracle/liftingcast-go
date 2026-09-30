@@ -1,5 +1,7 @@
 # liftingcast-go
 
+[![CI](https://github.com/theblindoracle/liftingcast-go/actions/workflows/ci.yml/badge.svg)](https://github.com/theblindoracle/liftingcast-go/actions/workflows/ci.yml)
+
 Go client for the LiftingCast meet-state WebSocket API.
 
 - `Client` dials the WebSocket, sends heartbeats, detects silent connections and reconnects with backoff.
