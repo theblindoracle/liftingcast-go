@@ -47,7 +47,7 @@ type Client struct {
 	conn *websocket.Conn
 
 	// Channels
-	dataUpdate chan *MeetApiResponse
+	dataUpdate chan json.RawMessage
 	errorChan  chan error
 	stop       chan struct{} // Closed by Close; ends the client for good
 	stopOnce   sync.Once
@@ -69,7 +69,7 @@ func NewClient(baseURL, meetID, password, apiKey string) *Client {
 		meetID:         meetID,
 		password:       password,
 		apiKey:         apiKey,
-		dataUpdate:     make(chan *MeetApiResponse, 10),
+		dataUpdate:     make(chan json.RawMessage, 10),
 		errorChan:      make(chan error, 10),
 		stop:           make(chan struct{}),
 		pingInterval:   pingInterval,
@@ -220,7 +220,8 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
 		return
 	}
 
-	// Try to parse as JSON (MeetApiResponse)
+	// Check the message is meet-state JSON, but pass on the raw bytes so the
+	// cache can tell which fields it left out
 	var meetData MeetApiResponse
 	if err := json.Unmarshal(message, &meetData); err != nil {
 		// Not valid JSON - treat as error message
@@ -231,7 +232,7 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
 
 	// Valid meet data update
 	select {
-	case c.dataUpdate <- &meetData:
+	case c.dataUpdate <- json.RawMessage(message):
 	case <-c.stop:
 		return
 	}
@@ -346,8 +347,9 @@ func (c *Client) stopped() bool {
 	}
 }
 
-// DataUpdate returns the channel for receiving meet data updates
-func (c *Client) DataUpdate() <-chan *MeetApiResponse {
+// DataUpdate returns the channel for receiving meet data updates, each the
+// raw JSON of one message. Pass them to Cache.Merge to build the full state.
+func (c *Client) DataUpdate() <-chan json.RawMessage {
 	return c.dataUpdate
 }
 

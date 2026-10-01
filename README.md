@@ -17,4 +17,21 @@ hub.RegisterBackendListener() <- liftingcast.NewBackendListener("mine", func(sta
 })
 ```
 
+Without a `Hub`, merge the `Client`'s raw messages into a `Cache` yourself:
+
+```go
+client := liftingcast.NewClient(baseURL, meetID, password, apiKey)
+if err := client.Connect(); err != nil {
+	return err
+}
+cache := liftingcast.NewCache()
+for raw := range client.DataUpdate() {
+	state, err := cache.Merge(raw)
+	if err != nil {
+		continue
+	}
+	// state is the full merged meet state, yours to modify
+}
+```
+
 The API is unstable until v1.

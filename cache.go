@@ -2,21 +2,23 @@ package liftingcast
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 )
 
 // Cache provides thread-safe storage and merging of meet data.
 //
-// Merge deep-merges nested maps rather than replacing each top-level key, so
-// a lifter or attempt deleted upstream stays in the cache until Clear.
-//
-// Updates are decoded into MeetApiResponse before merging, so a field left
-// out of an object the update does send is reset to its zero value. That is
-// harmless for LiftingCast, which sends each platform whole along with the
-// meet's name, federation and units.
+// Merge deep-merges each update as it arrived on the wire, so only the keys a
+// message sends change the cached state. Nested maps merge rather than
+// replace, so a lifter or attempt deleted upstream stays in the cache until
+// Clear.
 type Cache struct {
-	mu   sync.RWMutex
-	data *MeetApiResponse
+	mu sync.RWMutex
+
+	// state is the merged meet state as decoded JSON; data is the same state
+	// encoded, which Get and Merge decode into fresh MeetApiResponses.
+	state map[string]interface{}
+	data  []byte
 }
 
 // NewCache creates a new cache instance
@@ -24,26 +26,39 @@ func NewCache() *Cache {
 	return &Cache{}
 }
 
-// Merge merges partial update into the cached state
-// This mimics the frontend's {...prevData, ...newData} pattern
-func (c *Cache) Merge(update *MeetApiResponse) (*MeetApiResponse, error) {
+// Merge deep-merges a raw JSON message into the cached state and returns a
+// copy of the result, which the caller may modify. A message that is not a
+// JSON object, or that would leave a state not decodable as MeetApiResponse,
+// is rejected and leaves the cache unchanged.
+func (c *Cache) Merge(update []byte) (*MeetApiResponse, error) {
+	var updateMap map[string]interface{}
+	if err := json.Unmarshal(update, &updateMap); err != nil {
+		return nil, err
+	}
+	if updateMap == nil {
+		return nil, errors.New("liftingcast: meet update is null")
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If no existing data, this is the initial state
-	if c.data == nil {
-		c.data = update
-		return c.data, nil
+	merged := updateMap
+	if c.state != nil {
+		merged = mergeMaps(c.state, updateMap)
 	}
 
-	// Deep merge the update into existing data
-	merged, err := deepMergeMeetData(c.data, update)
+	data, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	result, err := decodeMeetData(data)
 	if err != nil {
 		return nil, err
 	}
 
-	c.data = merged
-	return c.data, nil
+	c.state = merged
+	c.data = data
+	return result, nil
 }
 
 // Get returns a copy of the current cached state
@@ -55,60 +70,24 @@ func (c *Cache) Get() *MeetApiResponse {
 		return nil
 	}
 
-	// Return a deep copy to prevent external modifications
-	return copyMeetData(c.data)
+	// The cached state was decodable when Merge stored it
+	result, _ := decodeMeetData(c.data)
+	return result
 }
 
 // Clear removes all cached data
 func (c *Cache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.state = nil
 	c.data = nil
 }
 
-// deepMergeMeetData performs a deep merge of two MeetApiResponse objects
-// The update object's fields override the base object's fields
-func deepMergeMeetData(base, update *MeetApiResponse) (*MeetApiResponse, error) {
-	// Use JSON marshaling/unmarshaling for deep merge
-	// This is the most reliable way to handle complex nested structures in Go
-
-	// Marshal both objects to JSON
-	baseJSON, err := json.Marshal(base)
-	if err != nil {
-		return nil, err
-	}
-
-	updateJSON, err := json.Marshal(update)
-	if err != nil {
-		return nil, err
-	}
-
-	// Unmarshal into map[string]interface{} for flexible merging
-	var baseMap map[string]interface{}
-	if err := json.Unmarshal(baseJSON, &baseMap); err != nil {
-		return nil, err
-	}
-
-	var updateMap map[string]interface{}
-	if err := json.Unmarshal(updateJSON, &updateMap); err != nil {
-		return nil, err
-	}
-
-	// Perform deep merge
-	merged := mergeMaps(baseMap, updateMap)
-
-	// Marshal back to JSON
-	mergedJSON, err := json.Marshal(merged)
-	if err != nil {
-		return nil, err
-	}
-
-	// Unmarshal into MeetApiResponse struct
+func decodeMeetData(data []byte) (*MeetApiResponse, error) {
 	var result MeetApiResponse
-	if err := json.Unmarshal(mergedJSON, &result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
 	}
-
 	return &result, nil
 }
 
@@ -147,20 +126,4 @@ func mergeMaps(base, update map[string]interface{}) map[string]interface{} {
 	}
 
 	return result
-}
-
-// copyMeetData creates a deep copy of MeetApiResponse
-func copyMeetData(data *MeetApiResponse) *MeetApiResponse {
-	// Use JSON marshaling/unmarshaling for deep copy
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return nil
-	}
-
-	var copy MeetApiResponse
-	if err := json.Unmarshal(jsonData, &copy); err != nil {
-		return nil
-	}
-
-	return &copy
 }
