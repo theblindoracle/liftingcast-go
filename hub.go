@@ -1,6 +1,7 @@
 package liftingcast
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 )
@@ -26,8 +27,10 @@ type ConnectionStatus struct {
 type Hub struct {
 	mu sync.RWMutex
 
-	// broadcast carries merged states from the upstream connection to Run
-	broadcast chan *MeetApiResponse
+	// broadcast carries raw messages from the upstream connection to Run,
+	// which merges them, so the cache never runs ahead of what listeners
+	// have been sent
+	broadcast chan upstreamMessage
 
 	// Backend listeners (in-process subscribers)
 	backendListeners  map[string]*BackendListener
@@ -74,7 +77,7 @@ func NewHub(baseURL, meetID, password, apiKey string) *Hub {
 // NewIdleHub creates a hub without an upstream connection (idle mode)
 func NewIdleHub() *Hub {
 	return &Hub{
-		broadcast:         make(chan *MeetApiResponse, 10),
+		broadcast:         make(chan upstreamMessage, 10),
 		backendListeners:  make(map[string]*BackendListener),
 		registerBackend:   make(chan *BackendListener),
 		unregisterBackend: make(chan *BackendListener),
@@ -92,8 +95,8 @@ func (h *Hub) Run() {
 			h.registerBackendListener(listener)
 		case listener := <-h.unregisterBackend:
 			h.unregisterBackendListener(listener)
-		case meetData := <-h.broadcast:
-			h.broadcastToBackendListeners(meetData)
+		case msg := <-h.broadcast:
+			h.handleUpstreamMessage(msg)
 		case req := <-h.reconnect:
 			h.handleReconnect(req)
 		}
@@ -218,20 +221,9 @@ func (h *Hub) maintainUpstreamConnection(client *Client, done <-chan struct{}) {
 		case <-done:
 			log.Println("Upstream connection stopped")
 			return
-		case meetData := <-client.DataUpdate():
-			// Merge with cache
-			merged, err := h.cache.Merge(meetData)
-			if err != nil {
-				log.Printf("Failed to merge data: %v", err)
-				continue
-			}
-
-			h.statusMu.Lock()
-			h.connected = true
-			h.statusMu.Unlock()
-
+		case raw := <-client.DataUpdate():
 			select {
-			case h.broadcast <- merged:
+			case h.broadcast <- upstreamMessage{client: client, raw: raw}:
 			case <-done:
 				return
 			}
@@ -246,6 +238,34 @@ func (h *Hub) maintainUpstreamConnection(client *Client, done <-chan struct{}) {
 			h.statusMu.Unlock()
 		}
 	}
+}
+
+// upstreamMessage is one raw message and the client it arrived on
+type upstreamMessage struct {
+	client *Client
+	raw    json.RawMessage
+}
+
+// handleUpstreamMessage merges a message into the cache and queues the
+// merged state for every listener
+func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
+	// Drop messages still in flight from a client that Reconnect or
+	// Disconnect has since replaced, so they can't seed the cleared cache
+	if msg.client != h.upstreamClient {
+		return
+	}
+
+	merged, err := h.cache.Merge(msg.raw)
+	if err != nil {
+		log.Printf("Failed to merge data: %v", err)
+		return
+	}
+
+	h.statusMu.Lock()
+	h.connected = true
+	h.statusMu.Unlock()
+
+	h.broadcastToBackendListeners(merged)
 }
 
 // broadcastToBackendListeners queues meet data for all registered backend listeners
