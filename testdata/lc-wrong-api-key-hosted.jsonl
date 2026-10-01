@@ -1,0 +1,9 @@
+{"rx":"2026-10-01T19:30:11.725303Z","conn":1,"event":"handshake","status":101}
+{"rx":"2026-10-01T19:30:11.725388Z","conn":1,"event":"text","bytes":22,"text":"Error: invalid api key"}
+{"rx":"2026-10-01T19:30:11.725451Z","conn":1,"event":"read_error","error":"websocket: close 1006 (abnormal closure): unexpected EOF"}
+{"rx":"2026-10-01T19:30:13.825981Z","conn":2,"event":"handshake","status":101}
+{"rx":"2026-10-01T19:30:13.826014Z","conn":2,"event":"text","bytes":22,"text":"Error: invalid api key"}
+{"rx":"2026-10-01T19:30:13.826084Z","conn":2,"event":"read_error","error":"websocket: close 1006 (abnormal closure): unexpected EOF"}
+{"rx":"2026-10-01T19:30:15.918121Z","conn":3,"event":"handshake","status":101}
+{"rx":"2026-10-01T19:30:15.918187Z","conn":3,"event":"text","bytes":22,"text":"Error: invalid api key"}
+{"rx":"2026-10-01T19:30:15.918273Z","conn":3,"event":"read_error","error":"websocket: close 1006 (abnormal closure): unexpected EOF"}

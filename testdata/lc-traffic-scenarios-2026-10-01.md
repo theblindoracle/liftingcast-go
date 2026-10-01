@@ -1,6 +1,7 @@
 # lc-traffic-scenarios-2026-10-01.jsonl
 
-LiftingCast WebSocket traffic for one meet with one platform, recorded with
+LiftingCast WebSocket traffic from Self-hosted LiftingCast (the Docker image)
+for one meet with one platform, recorded with
 liftingcast-clipper's `prototype/lc-tap` while the scenarios below were run in
 the LiftingCast UI. One line per message: receive time, size, raw message.
 Lifter names, member numbers, states, countries and the meet name are replaced

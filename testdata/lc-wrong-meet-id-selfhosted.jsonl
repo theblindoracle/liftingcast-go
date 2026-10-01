@@ -1,0 +1,9 @@
+{"rx":"2026-10-01T19:25:15.580307Z","conn":1,"event":"handshake","status":101}
+{"rx":"2026-10-01T19:25:15.584934Z","conn":1,"event":"text","bytes":69,"text":"Error: unauthorized - meet id or password in auth param are incorrect"}
+{"rx":"2026-10-01T19:25:15.584973Z","conn":1,"event":"read_error","error":"websocket: close 1006 (abnormal closure): unexpected EOF"}
+{"rx":"2026-10-01T19:25:17.594084Z","conn":2,"event":"handshake","status":101}
+{"rx":"2026-10-01T19:25:17.598978Z","conn":2,"event":"text","bytes":69,"text":"Error: unauthorized - meet id or password in auth param are incorrect"}
+{"rx":"2026-10-01T19:25:17.599092Z","conn":2,"event":"read_error","error":"websocket: close 1006 (abnormal closure): unexpected EOF"}
+{"rx":"2026-10-01T19:25:19.605154Z","conn":3,"event":"handshake","status":101}
+{"rx":"2026-10-01T19:25:19.611012Z","conn":3,"event":"text","bytes":69,"text":"Error: unauthorized - meet id or password in auth param are incorrect"}
+{"rx":"2026-10-01T19:25:19.61112Z","conn":3,"event":"read_error","error":"websocket: close 1006 (abnormal closure): unexpected EOF"}
