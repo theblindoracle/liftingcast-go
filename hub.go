@@ -14,7 +14,7 @@ type ReconnectRequest struct {
 	APIKey   string
 }
 
-// ConnectionStatus represents the current status of the upstream connection
+// ConnectionStatus is the Client's ClientStatus plus the meet it is for
 type ConnectionStatus struct {
 	Connected bool   `json:"connected"`
 	MeetID    string `json:"meetId"`
@@ -40,37 +40,26 @@ type Hub struct {
 	// Shared cache for meet data
 	cache *Cache
 
-	// Single persistent upstream LiftingCast connection
+	// Single persistent upstream LiftingCast connection and its meet. Only
+	// Run changes them, under upstreamMu, so GetStatus can read them.
+	upstreamMu     sync.RWMutex
 	upstreamClient *Client
-	upstreamDone   chan struct{} // Signals to stop upstream connection goroutine
+	meetID         string
 
 	// Reconnection channel
 	reconnect chan *ReconnectRequest
-
-	// LiftingCast connection configuration
-	baseURL  string
-	meetID   string
-	password string
-	apiKey   string
-
-	// Connection status
-	statusMu  sync.RWMutex
-	connected bool
-	lastError string
 }
 
 // NewHub creates a new hub instance with an upstream connection
 func NewHub(baseURL, meetID, password, apiKey string) *Hub {
 	hub := NewIdleHub()
-	hub.baseURL = baseURL
 	hub.meetID = meetID
-	hub.password = password
-	hub.apiKey = apiKey
-
-	// Create and start the persistent upstream connection
-	hub.upstreamClient = NewClient(baseURL, meetID, password, apiKey)
-	go hub.maintainUpstreamConnection(hub.upstreamClient, hub.upstreamDone)
-
+	hub.upstreamClient = hub.startClient(&ReconnectRequest{
+		BaseURL:  baseURL,
+		MeetID:   meetID,
+		Password: password,
+		APIKey:   apiKey,
+	})
 	return hub
 }
 
@@ -82,7 +71,6 @@ func NewIdleHub() *Hub {
 		registerBackend:   make(chan *BackendListener),
 		unregisterBackend: make(chan *BackendListener),
 		cache:             NewCache(),
-		upstreamDone:      make(chan struct{}),
 		reconnect:         make(chan *ReconnectRequest),
 	}
 }
@@ -120,13 +108,18 @@ func (h *Hub) Disconnect() {
 
 // GetStatus returns the current connection status
 func (h *Hub) GetStatus() ConnectionStatus {
-	h.statusMu.RLock()
-	defer h.statusMu.RUnlock()
+	h.upstreamMu.RLock()
+	client, meetID := h.upstreamClient, h.meetID
+	h.upstreamMu.RUnlock()
 
+	var clientStatus ClientStatus
+	if client != nil {
+		clientStatus = client.Status()
+	}
 	status := ConnectionStatus{
-		Connected: h.connected,
-		MeetID:    h.meetID,
-		Error:     h.lastError,
+		Connected: clientStatus.Connected,
+		MeetID:    meetID,
+		Error:     clientStatus.LastError,
 	}
 
 	// Try to get meet name from cache
@@ -144,106 +137,44 @@ func (h *Hub) handleReconnect(req *ReconnectRequest) {
 	// Stop existing upstream connection if present
 	if h.upstreamClient != nil {
 		log.Println("Stopping existing upstream connection")
-
-		// Signal maintainUpstreamConnection to stop before closing the
-		// client, so it doesn't report the shutdown as an error
-		close(h.upstreamDone)
 		h.upstreamClient.Close()
+		h.upstreamMu.Lock()
 		h.upstreamClient = nil
+		h.upstreamMu.Unlock()
 	}
 
 	// Clear cache
 	h.cache.Clear()
 
-	// Update status
-	h.statusMu.Lock()
-	h.connected = false
-	h.lastError = ""
-	h.statusMu.Unlock()
-
 	// If nil request, stay in idle mode
 	if req == nil {
 		log.Println("Entering idle mode (no upstream connection)")
-		h.statusMu.Lock()
+		h.upstreamMu.Lock()
 		h.meetID = ""
-		h.baseURL = ""
-		h.password = ""
-		h.apiKey = ""
-		h.statusMu.Unlock()
+		h.upstreamMu.Unlock()
 		return
 	}
 
-	// Update configuration
-	h.statusMu.Lock()
-	h.baseURL = req.BaseURL
+	client := h.startClient(req)
+	h.upstreamMu.Lock()
+	h.upstreamClient = client
 	h.meetID = req.MeetID
-	h.password = req.Password
-	h.apiKey = req.APIKey
-	h.statusMu.Unlock()
-
-	// Create new done channel
-	h.upstreamDone = make(chan struct{})
-
-	// Create new client and start connection
-	h.upstreamClient = NewClient(req.BaseURL, req.MeetID, req.Password, req.APIKey)
-	go h.maintainUpstreamConnection(h.upstreamClient, h.upstreamDone)
+	h.upstreamMu.Unlock()
 
 	log.Printf("Reconnection initiated for meet: %s", req.MeetID)
 }
 
-// maintainUpstreamConnection manages the persistent LiftingCast connection.
-// client and done are passed in because handleReconnect replaces the hub's
-// fields while this goroutine may still be running.
-func (h *Hub) maintainUpstreamConnection(client *Client, done <-chan struct{}) {
-	// Connect to LiftingCast API, retrying until it succeeds or the client
-	// is closed
-	if err := client.Connect(); err != nil {
-		log.Printf("Failed to connect to LiftingCast: %v", err)
-		h.statusMu.Lock()
-		h.lastError = err.Error()
-		h.statusMu.Unlock()
-
-		client.reconnect()
-		if client.stopped() {
-			return
+// startClient starts a new upstream connection and forwards its messages to
+// Run until it is closed.
+func (h *Hub) startClient(req *ReconnectRequest) *Client {
+	client := NewClient(req.BaseURL, req.MeetID, req.Password, req.APIKey)
+	client.Start()
+	go func() {
+		for raw := range client.Messages() {
+			h.upstream <- upstreamMessage{client: client, raw: raw}
 		}
-	}
-
-	// Update status to connected
-	h.statusMu.Lock()
-	h.connected = true
-	h.lastError = ""
-	h.statusMu.Unlock()
-
-	// Handle messages from upstream LiftingCast connection
-	for {
-		select {
-		case <-done:
-			log.Println("Upstream connection stopped")
-			return
-		case raw := <-client.DataUpdate():
-			// Set here, in order with the error case below, not when Run
-			// gets to the message
-			h.statusMu.Lock()
-			h.connected = true
-			h.statusMu.Unlock()
-
-			select {
-			case h.upstream <- upstreamMessage{client: client, raw: raw}:
-			case <-done:
-				return
-			}
-
-		case err := <-client.Errors():
-			// Most errors mean the connection dropped and the client is
-			// reconnecting; the next message marks the hub connected again.
-			log.Printf("LiftingCast upstream error: %v", err)
-			h.statusMu.Lock()
-			h.connected = false
-			h.lastError = err.Error()
-			h.statusMu.Unlock()
-		}
-	}
+	}()
+	return client
 }
 
 // upstreamMessage is one raw message and the client it arrived on
