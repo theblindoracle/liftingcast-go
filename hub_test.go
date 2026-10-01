@@ -12,7 +12,7 @@ import (
 
 func TestHubHandsMergedStateToListeners(t *testing.T) {
 	srv := newFakeServer(t)
-	hub := NewHub(srv.url, "meet", "password", "key")
+	hub := newTestHub(srv.url)
 	t.Cleanup(hub.Close)
 
 	states := make(chan *MeetApiResponse, 10)
@@ -51,6 +51,54 @@ func TestHubHandsMergedStateToListeners(t *testing.T) {
 	}
 }
 
+func TestHubConnectReplacesTheUpstreamConnection(t *testing.T) {
+	srv := newFakeServer(t)
+	hub := NewHub()
+	t.Cleanup(hub.Close)
+	states := make(chan *MeetApiResponse, 10)
+	hub.Listen(func(m *MeetApiResponse) { states <- m })
+	next := func() *MeetApiResponse {
+		t.Helper()
+		select {
+		case m := <-states:
+			return m
+		case <-time.After(time.Second):
+			t.Fatal("listener received no meet state")
+			return nil
+		}
+	}
+
+	hub.Connect(Config{BaseURL: srv.url, MeetID: "a"})
+	connA := srv.accept(t, time.Second)
+	if err := connA.WriteMessage(websocket.TextMessage, []byte(`{"name": "Meet A", "lifters": {"l1": {"id": "l1"}}}`)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if m := next(); m.Name != "Meet A" {
+		t.Fatalf("name = %q, want Meet A", m.Name)
+	}
+
+	hub.Connect(Config{BaseURL: srv.url, MeetID: "b"})
+	connB := srv.accept(t, time.Second)
+	if err := connB.WriteMessage(websocket.TextMessage, []byte(`{"name": "Meet B"}`)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m := next()
+	if m.Name != "Meet B" {
+		t.Fatalf("name = %q, want Meet B", m.Name)
+	}
+	if m.Lifters != nil {
+		t.Errorf("lifters = %v, want none carried over from Meet A", m.Lifters)
+	}
+	if status := hub.GetStatus(); status.MeetID != "b" || status.MeetName != "Meet B" {
+		t.Errorf("status = %+v, want meet b", status)
+	}
+
+	hub.Disconnect()
+	if status := hub.GetStatus(); status != (ConnectionStatus{}) {
+		t.Errorf("status = %+v after Disconnect, want the zero status", status)
+	}
+}
+
 // startHub returns a hub connected to a fake server, and a function that
 // sends the server's connection one message per lot number, each setting
 // lifter l1's lot so listeners can tell the messages apart.
@@ -65,7 +113,7 @@ func startHub(t *testing.T) (*Hub, func(lots ...int)) {
 func startHubConn(t *testing.T) (*Hub, func(lots ...int), *websocket.Conn) {
 	t.Helper()
 	srv := newFakeServer(t)
-	hub := NewHub(srv.url, "meet", "password", "key")
+	hub := newTestHub(srv.url)
 	t.Cleanup(hub.Close)
 
 	conn := srv.accept(t, time.Second)
@@ -360,7 +408,7 @@ func TestHubReportsDisconnectedAfterDropEvenWithStatesQueued(t *testing.T) {
 
 func TestHubReportsRejection(t *testing.T) {
 	srv := newFakeServer(t)
-	hub := NewHub(srv.url, "meet", "password", "key")
+	hub := newTestHub(srv.url)
 	t.Cleanup(hub.Close)
 	replay(t, srv.accept(t, time.Second), loadRecording(t, "lc-wrong-password-hosted.jsonl")[0])
 
@@ -498,7 +546,7 @@ func TestHubHandlersClosingTogetherDontDeadlock(t *testing.T) {
 
 func TestHubDoesNothingAfterClose(t *testing.T) {
 	srv := newFakeServer(t)
-	hub := NewHub(srv.url, "meet", "password", "key")
+	hub := newTestHub(srv.url)
 	t.Cleanup(hub.Close)
 	conn := srv.accept(t, time.Second)
 	first := newLotRecorder()
@@ -511,7 +559,7 @@ func TestHubDoesNothingAfterClose(t *testing.T) {
 
 	called := make(chan struct{}, 1)
 	stop := hub.Listen(func(*MeetApiResponse) { called <- struct{}{} })
-	hub.Reconnect(srv.url, "meet", "password", "key")
+	hub.Connect(testConfig(srv.url))
 	srv.expectNoAttempt(t, 100*time.Millisecond)
 	hub.Disconnect()
 	stop()
@@ -528,9 +576,16 @@ func TestHubDoesNothingAfterClose(t *testing.T) {
 }
 
 func TestHubCloseTwiceIsHarmless(t *testing.T) {
-	hub := NewIdleHub()
+	hub := NewHub()
 	hub.Close()
 	hub.Close()
+}
+
+// newTestHub returns a hub connected to url
+func newTestHub(url string) *Hub {
+	hub := NewHub()
+	hub.Connect(testConfig(url))
+	return hub
 }
 
 // waitForHubStatus waits until the hub's status satisfies ok.

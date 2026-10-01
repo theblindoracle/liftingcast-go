@@ -2,7 +2,9 @@ package liftingcast
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,11 +104,16 @@ func (s *fakeServer) accept(t *testing.T, within time.Duration) *websocket.Conn 
 	}
 }
 
+// testConfig returns the Config the tests connect to url with
+func testConfig(url string) Config {
+	return Config{BaseURL: url, MeetID: "meet", Password: "password", APIKey: "key"}
+}
+
 // newIdleTestClient returns a client with shortened timings that has not yet
 // started. Tests may adjust its timings before calling Start.
 func newIdleTestClient(t *testing.T, url string, ping, timeout time.Duration) *Client {
 	t.Helper()
-	c := NewClient(url, "meet", "password", "key")
+	c := NewClient(testConfig(url))
 	c.pingInterval = ping
 	c.messageTimeout = timeout
 	c.initialBackoff = 10 * time.Millisecond
@@ -710,4 +718,36 @@ func TestClientForgetsServerErrorFollowedByMeetState(t *testing.T) {
 	if strings.Contains(status.LastError, "not json") {
 		t.Errorf("status = %+v after the drop, want the drop as LastError, not a server error meet state followed", status)
 	}
+}
+
+func TestClientLogsToTheGivenLogger(t *testing.T) {
+	srv := newFakeServer(t)
+	logs := &syncBuffer{}
+	c := NewClient(testConfig(srv.url), WithLogger(slog.New(slog.NewTextHandler(logs, nil))))
+	t.Cleanup(c.Close)
+	c.Start()
+	srv.accept(t, time.Second)
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+
+	if got := logs.String(); !strings.Contains(got, "connected to LiftingCast") || !strings.Contains(got, "meetID=meet") {
+		t.Errorf("logs = %q, want the connection logged with its meet ID", got)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger and a test to share
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

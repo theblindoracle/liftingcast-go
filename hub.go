@@ -2,17 +2,8 @@ package liftingcast
 
 import (
 	"encoding/json"
-	"log"
 	"sync"
 )
-
-// ReconnectRequest contains the credentials for a new upstream connection
-type ReconnectRequest struct {
-	BaseURL  string
-	MeetID   string
-	Password string
-	APIKey   string
-}
 
 // ConnectionStatus is the Client's ClientStatus plus the meet it is for
 type ConnectionStatus struct {
@@ -25,8 +16,11 @@ type ConnectionStatus struct {
 
 // Hub keeps one upstream LiftingCast connection alive, merges its messages
 // into a Cache, and hands each merged state to in-process listeners added
-// with Listen. It runs its own loop from NewHub or NewIdleHub until Close.
+// with Listen. It starts with no upstream connection: Connect starts one and
+// Disconnect stops it. It runs its own loop from NewHub until Close.
 type Hub struct {
+	opts options
+
 	// upstream carries raw messages from the upstream connection to the
 	// loop, which merges them, so the cache never runs ahead of what
 	// listeners have been sent
@@ -48,8 +42,8 @@ type Hub struct {
 	upstreamClient *Client
 	meetID         string
 
-	// Reconnection channel
-	reconnect chan *ReconnectRequest
+	// Carries Connect's and Disconnect's requests to the loop
+	connect chan connectRequest
 
 	// closing is closed by the first Close, which then waits for the loop to
 	// shut down and close closed. The loop leaves the listeners it stopped
@@ -60,6 +54,13 @@ type Hub struct {
 	final     []*listener
 }
 
+// connectRequest asks the loop to replace the upstream connection with one
+// for cfg, or with none if cfg is nil, and is answered on done once it has
+type connectRequest struct {
+	cfg  *Config
+	done chan struct{}
+}
+
 // listenRequest asks the loop to add a listener, and is answered on
 // registered once it has
 type listenRequest struct {
@@ -67,38 +68,21 @@ type listenRequest struct {
 	registered chan struct{}
 }
 
-// NewHub creates a new hub instance with an upstream connection
-func NewHub(baseURL, meetID, password, apiKey string) *Hub {
-	hub := newHub()
-	hub.meetID = meetID
-	hub.upstreamClient = hub.startClient(&ReconnectRequest{
-		BaseURL:  baseURL,
-		MeetID:   meetID,
-		Password: password,
-		APIKey:   apiKey,
-	})
-	go hub.run()
-	return hub
-}
-
-// NewIdleHub creates a hub without an upstream connection (idle mode)
-func NewIdleHub() *Hub {
-	hub := newHub()
-	go hub.run()
-	return hub
-}
-
-// newHub creates a hub whose loop has not started
-func newHub() *Hub {
-	return &Hub{
+// NewHub creates a hub with no upstream connection and starts its loop. Call
+// Connect to follow a meet, and Close when done with the hub.
+func NewHub(opts ...Option) *Hub {
+	hub := &Hub{
+		opts:      newOptions(opts),
 		upstream:  make(chan upstreamMessage, 10),
 		listeners: make(map[*listener]struct{}),
 		listen:    make(chan listenRequest),
 		cache:     NewCache(),
-		reconnect: make(chan *ReconnectRequest),
+		connect:   make(chan connectRequest),
 		closing:   make(chan struct{}),
 		closed:    make(chan struct{}),
 	}
+	go hub.run()
+	return hub
 }
 
 // run is the hub's loop. It alone merges upstream messages, adds listeners
@@ -112,8 +96,9 @@ func (h *Hub) run() {
 			close(req.registered)
 		case msg := <-h.upstream:
 			h.handleUpstreamMessage(msg)
-		case req := <-h.reconnect:
-			h.handleReconnect(req)
+		case req := <-h.connect:
+			h.handleConnect(req.cfg)
+			close(req.done)
 		case <-h.closing:
 			h.shutdown()
 			return
@@ -161,29 +146,33 @@ func (h *Hub) Listen(handler func(*MeetApiResponse)) (stop func()) {
 	}
 }
 
-// Reconnect triggers a reconnection with new credentials. After Close it
-// does nothing.
-func (h *Hub) Reconnect(baseURL, meetID, password, apiKey string) {
-	h.requestReconnect(&ReconnectRequest{
-		BaseURL:  baseURL,
-		MeetID:   meetID,
-		Password: password,
-		APIKey:   apiKey,
-	})
+// Connect replaces the upstream connection, if there is one, with a new one
+// for the meet and credentials in cfg, and clears the meet state. Listeners
+// stay in place and receive the new meet's states. It returns once the new
+// connection has been started, so GetStatus reports the new meet. After Close
+// it does nothing.
+func (h *Hub) Connect(cfg Config) {
+	h.requestConnect(&cfg)
 }
 
-// Disconnect stops the upstream connection and puts the hub in idle mode.
-// After Close it does nothing.
+// Disconnect stops the upstream connection, if there is one, and clears the
+// meet state. Listeners stay in place for the next Connect. It returns once
+// the connection has been stopped. After Close it does nothing.
 func (h *Hub) Disconnect() {
-	h.requestReconnect(nil)
+	h.requestConnect(nil)
 }
 
-// requestReconnect hands req to the loop, unless the hub is closing
-func (h *Hub) requestReconnect(req *ReconnectRequest) {
+// requestConnect hands cfg to the loop and waits until the loop has acted
+// on it, unless the hub is closing
+func (h *Hub) requestConnect(cfg *Config) {
+	req := connectRequest{cfg: cfg, done: make(chan struct{})}
 	select {
-	case h.reconnect <- req:
+	case h.connect <- req:
 	case <-h.closing:
+		return
 	}
+	// The loop always answers a request it has taken
+	<-req.done
 }
 
 // Close closes the upstream connection and stops every listener, with the
@@ -191,7 +180,7 @@ func (h *Hub) requestReconnect(req *ReconnectRequest) {
 // running or will be called again. Called from inside a handler, it only
 // makes sure no further handler call starts, as stop does. Close may be
 // called any number of times. Afterwards the hub stays closed: see Listen,
-// Reconnect, Disconnect and GetStatus.
+// Connect, Disconnect and GetStatus.
 func (h *Hub) Close() {
 	h.closeOnce.Do(func() { close(h.closing) })
 	<-h.closed
@@ -220,7 +209,7 @@ func (h *Hub) shutdown() {
 	}
 	h.listeners = nil
 	h.mu.Unlock()
-	log.Println("Hub closed")
+	h.opts.logger.Info("hub closed")
 }
 
 // GetStatus returns the current connection status. After Close it returns
@@ -249,13 +238,12 @@ func (h *Hub) GetStatus() ConnectionStatus {
 	return status
 }
 
-// handleReconnect processes a reconnection request
-func (h *Hub) handleReconnect(req *ReconnectRequest) {
-	log.Println("Processing reconnection request...")
-
+// handleConnect replaces the upstream connection with one for cfg, or with
+// none if cfg is nil
+func (h *Hub) handleConnect(cfg *Config) {
 	// Stop existing upstream connection if present
 	if h.upstreamClient != nil {
-		log.Println("Stopping existing upstream connection")
+		h.opts.logger.Info("stopping upstream connection", "meetID", h.meetID)
 		h.upstreamClient.Close()
 		h.upstreamMu.Lock()
 		h.upstreamClient = nil
@@ -265,28 +253,25 @@ func (h *Hub) handleReconnect(req *ReconnectRequest) {
 	// Clear cache
 	h.cache.Clear()
 
-	// If nil request, stay in idle mode
-	if req == nil {
-		log.Println("Entering idle mode (no upstream connection)")
+	// Disconnect leaves the hub without an upstream connection
+	if cfg == nil {
 		h.upstreamMu.Lock()
 		h.meetID = ""
 		h.upstreamMu.Unlock()
 		return
 	}
 
-	client := h.startClient(req)
+	client := h.startClient(*cfg)
 	h.upstreamMu.Lock()
 	h.upstreamClient = client
-	h.meetID = req.MeetID
+	h.meetID = cfg.MeetID
 	h.upstreamMu.Unlock()
-
-	log.Printf("Reconnection initiated for meet: %s", req.MeetID)
 }
 
 // startClient starts a new upstream connection and forwards its messages to
 // the loop until it is closed or the hub has closed.
-func (h *Hub) startClient(req *ReconnectRequest) *Client {
-	client := NewClient(req.BaseURL, req.MeetID, req.Password, req.APIKey)
+func (h *Hub) startClient(cfg Config) *Client {
+	client := NewClient(cfg, WithLogger(h.opts.logger))
 	client.Start()
 	go func() {
 		for raw := range client.Messages() {
@@ -309,7 +294,7 @@ type upstreamMessage struct {
 // handleUpstreamMessage merges a message into the cache and queues the
 // merged state for every listener
 func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
-	// Drop messages still in flight from a client that Reconnect or
+	// Drop messages still in flight from a client that Connect or
 	// Disconnect has since replaced, so they can't seed the cleared cache
 	if msg.client != h.upstreamClient {
 		return
@@ -317,7 +302,7 @@ func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
 
 	merged, err := h.cache.Merge(msg.raw)
 	if err != nil {
-		log.Printf("Failed to merge data: %v", err)
+		h.opts.logger.Warn("failed to merge meet state", "meetID", h.meetID, "err", err)
 		return
 	}
 
@@ -348,5 +333,5 @@ func (h *Hub) addListener(l *listener) {
 	count := len(h.listeners)
 	h.mu.Unlock()
 
-	log.Printf("Listener added (total listeners: %d)", count)
+	h.opts.logger.Debug("listener added", "listeners", count)
 }
