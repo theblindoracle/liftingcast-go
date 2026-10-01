@@ -175,6 +175,15 @@ type DivisionData struct {
 // Divisions maps division IDs to division data
 type Divisions map[string]DivisionData
 
+// TeamData represents a team's standing
+type TeamData struct {
+	Place  int     `json:"place"`
+	Points float64 `json:"points"`
+}
+
+// Teams maps team names to team standings
+type Teams map[string]TeamData
+
 // MeetApiResponse represents the complete meet state from LiftingCast API
 type MeetApiResponse struct {
 	Name       string     `json:"name"`
@@ -183,4 +192,5 @@ type MeetApiResponse struct {
 	Lifters    *Lifters   `json:"lifters,omitempty"`
 	Platforms  *Platform  `json:"platforms,omitempty"`
 	Divisions  *Divisions `json:"divisions,omitempty"`
+	Teams      *Teams     `json:"teams,omitempty"`
 }

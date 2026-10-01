@@ -3,21 +3,26 @@ package liftingcast
 import (
 	"encoding/json"
 	"errors"
+	"maps"
 	"sync"
 )
 
-// Cache provides thread-safe storage and merging of meet data.
+// Cache provides thread-safe storage of one meet state, built up from the
+// messages LiftingCast sends.
 //
-// Merge deep-merges each update as it arrived on the wire, so only the keys a
-// message sends change the cached state. Nested maps merge rather than
-// replace, so a lifter or attempt deleted upstream stays in the cache until
-// Clear.
+// Merge applies each message section by section: every section a message
+// carries replaces the cached copy whole, and sections it leaves out keep
+// their cached copy. LiftingCast sends each section complete, so an
+// entry missing from a section it sends was deleted upstream and disappears
+// from the cache (see docs/adr/0002-sections-replace-whole.md). Entries can
+// still refer to ones the meet state lacks: LiftingCast sends divisions only
+// when one is edited, so a lifter can name a division not yet in Divisions.
 type Cache struct {
 	mu sync.RWMutex
 
-	// state is the merged meet state as decoded JSON; data is the same state
+	// state is the meet state as raw JSON per section; data is the same state
 	// encoded, which Get and Merge decode into fresh MeetApiResponses.
-	state map[string]interface{}
+	state map[string]json.RawMessage
 	data  []byte
 }
 
@@ -26,26 +31,25 @@ func NewCache() *Cache {
 	return &Cache{}
 }
 
-// Merge deep-merges a raw JSON message into the cached state and returns a
-// copy of the result, which the caller may modify. A message that is not a
-// JSON object, or that would leave a state not decodable as MeetApiResponse,
-// is rejected and leaves the cache unchanged.
+// Merge replaces each section a raw JSON message carries in the cached state
+// and returns a copy of the result, which the caller may modify. A message
+// that is not a JSON object, or that would leave a state not decodable as
+// MeetApiResponse, is rejected and leaves the cache unchanged.
 func (c *Cache) Merge(update []byte) (*MeetApiResponse, error) {
-	var updateMap map[string]interface{}
-	if err := json.Unmarshal(update, &updateMap); err != nil {
+	var sections map[string]json.RawMessage
+	if err := json.Unmarshal(update, &sections); err != nil {
 		return nil, err
 	}
-	if updateMap == nil {
+	if sections == nil {
 		return nil, errors.New("liftingcast: meet update is null")
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	merged := updateMap
-	if c.state != nil {
-		merged = mergeMaps(c.state, updateMap)
-	}
+	merged := make(map[string]json.RawMessage, len(c.state)+len(sections))
+	maps.Copy(merged, c.state)
+	maps.Copy(merged, sections)
 
 	data, err := json.Marshal(merged)
 	if err != nil {
@@ -89,41 +93,4 @@ func decodeMeetData(data []byte) (*MeetApiResponse, error) {
 		return nil, err
 	}
 	return &result, nil
-}
-
-// mergeMaps recursively merges two maps
-func mergeMaps(base, update map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-
-	// Copy all base values
-	for k, v := range base {
-		result[k] = v
-	}
-
-	// Merge/override with update values
-	for k, updateValue := range update {
-		if baseValue, exists := result[k]; exists {
-			// If both are maps, merge them recursively
-			// baseValue.(map[string]interface{}) is a type assertion
-			if baseMap, baseIsMap := baseValue.(map[string]interface{}); baseIsMap {
-				if updateMap, updateIsMap := updateValue.(map[string]interface{}); updateIsMap {
-					// If update map is empty, overwrite base with empty map
-					if len(updateMap) == 0 {
-						result[k] = updateMap
-						continue
-					}
-					if k == "ifSuccessfulScores" || k == "ifSuccessfulPlaces" {
-						result[k] = updateMap
-						continue
-					}
-					result[k] = mergeMaps(baseMap, updateMap)
-					continue
-				}
-			}
-		}
-		// Otherwise, update value overrides base value
-		result[k] = updateValue
-	}
-
-	return result
 }

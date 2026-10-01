@@ -5,8 +5,12 @@ A Go library that follows one LiftingCast meet live and hands the current meet s
 ## Language
 
 **Meet state**:
-The full, merged picture of one meet (lifters, platforms, attempts) built up from the partial messages LiftingCast sends.
+The full picture of one meet, made up of its sections and built up from the messages LiftingCast sends. Each message carries one or more sections.
 _Avoid_: meet data, snapshot
+
+**Section**:
+One top-level part of the meet state: the meet name, units or federation, lifters, platforms, divisions or teams. LiftingCast sends each section complete or not at all, so the newest copy of a section replaces the previous one, and anything missing from it no longer exists upstream.
+_Avoid_: key, part
 
 **Upstream connection**:
 The single live link to LiftingCast for one meet and one set of credentials. It keeps trying to connect until it is deliberately closed. Switching meets or credentials means replacing it, not changing it.
