@@ -35,14 +35,22 @@ const (
 	writeWait = 10 * time.Second
 )
 
-// ErrClientClosed is returned by Connect after Close has been called.
-var ErrClientClosed = errors.New("liftingcast: client closed")
+// errClientClosed is returned by dial after Close has been called.
+var errClientClosed = errors.New("liftingcast: client closed")
 
-// Client represents a WebSocket client connection to the LiftingCast API.
+// ClientStatus is the connection status of a Client: whether it is connected
+// right now, and the most recent error it saw. Connected means LiftingCast
+// accepted the connection, not that the credentials are known to be good.
+type ClientStatus struct {
+	Connected bool
+	LastError string
+}
+
+// Client is the upstream connection to LiftingCast for one meet.
 //
-// It reconnects on its own whenever a connection drops or times out, until
-// Close is called. Each connection gets its own read, ping and timeout
-// goroutines, which all stop when that connection ends.
+// Once started it dials, and redials with backoff whenever a dial fails or a
+// connection drops or times out, until Close is called. Each connection gets
+// its own ping and timeout goroutines, which stop when that connection ends.
 type Client struct {
 	// Connection configuration
 	baseURL  string
@@ -50,15 +58,20 @@ type Client struct {
 	password string
 	apiKey   string
 
-	// Current WebSocket connection, replaced on each reconnect
-	mu   sync.Mutex
-	conn *websocket.Conn
+	// Current WebSocket connection, replaced on each reconnect, and whether
+	// Start has run
+	mu      sync.Mutex
+	conn    *websocket.Conn
+	started bool
 
-	// Channels
-	dataUpdate chan json.RawMessage
-	errorChan  chan error
-	stop       chan struct{} // Closed by Close; ends the client for good
-	stopOnce   sync.Once
+	// messages carries meet state. Only run sends on it, and closes it when
+	// it exits; Close closes it if run never started.
+	messages chan json.RawMessage
+	stop     chan struct{} // Closed by Close; ends the client for good
+
+	// Connection status, set by run as it sees each change
+	statusMu sync.Mutex
+	status   ClientStatus
 
 	// Timings, defaulted from the package constants and shortened in tests
 	pingInterval     time.Duration
@@ -67,38 +80,73 @@ type Client struct {
 	maxBackoff       time.Duration
 	handshakeTimeout time.Duration
 
-	// Reconnection state. Only one goroutine reconnects at a time: the
-	// readPump of the connection that ended, before it starts the next one.
+	// Wait before the next dial, only used by run
 	backoff time.Duration
 }
 
-// NewClient creates a new LiftingCast WebSocket client
+// NewClient creates a LiftingCast WebSocket client. It does not connect
+// until Start is called.
 func NewClient(baseURL, meetID, password, apiKey string) *Client {
 	return &Client{
 		baseURL:          baseURL,
 		meetID:           meetID,
 		password:         password,
 		apiKey:           apiKey,
-		dataUpdate:       make(chan json.RawMessage, 10),
-		errorChan:        make(chan error, 10),
+		messages:         make(chan json.RawMessage, 10),
 		stop:             make(chan struct{}),
 		pingInterval:     pingInterval,
 		messageTimeout:   messageTimeout,
 		initialBackoff:   initialBackoff,
 		maxBackoff:       maxBackoff,
 		handshakeTimeout: handshakeTimeout,
-		backoff:          initialBackoff,
 	}
 }
 
-// Connect establishes the WebSocket connection
-func (c *Client) Connect() error {
-	conn, err := c.dial()
-	if err != nil {
-		return err
+// Start begins connecting, and keeps the client connected until Close. It
+// does nothing if the client is already started or closed.
+func (c *Client) Start() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.started || c.stopped() {
+		return
 	}
-	c.start(conn)
-	return nil
+	c.started = true
+	go c.run()
+}
+
+// run dials, serves each connection until it ends, and waits out the backoff
+// before dialling again, until Close.
+func (c *Client) run() {
+	defer close(c.messages)
+	c.backoff = c.initialBackoff
+	for {
+		conn, err := c.dial()
+		if errors.Is(err, errClientClosed) {
+			return
+		}
+		if err != nil {
+			log.Printf("Failed to connect to LiftingCast: %v", err)
+			c.setStatus(ClientStatus{LastError: err.Error()})
+		} else {
+			c.backoff = c.initialBackoff
+			c.setStatus(ClientStatus{Connected: true})
+			err := c.serve(conn)
+			if err == nil {
+				c.setStatus(ClientStatus{})
+				return
+			}
+			log.Printf("LiftingCast connection dropped: %v", err)
+			c.setStatus(ClientStatus{LastError: err.Error()})
+		}
+
+		log.Printf("Attempting to reconnect in %v", c.backoff)
+		select {
+		case <-time.After(c.backoff):
+		case <-c.stop:
+			return
+		}
+		c.backoff = min(c.backoff*2, c.maxBackoff)
+	}
 }
 
 // dial makes one attempt to open a new connection and make it the current
@@ -145,7 +193,7 @@ func (c *Client) dial() (*websocket.Conn, error) {
 			defer netMu.Unlock()
 			if c.stopped() {
 				conn.Close()
-				return nil, ErrClientClosed
+				return nil, errClientClosed
 			}
 			netConn = conn
 			return conn, nil
@@ -154,7 +202,7 @@ func (c *Client) dial() (*websocket.Conn, error) {
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		if c.stopped() {
-			return nil, ErrClientClosed
+			return nil, errClientClosed
 		}
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
@@ -164,22 +212,10 @@ func (c *Client) dial() (*websocket.Conn, error) {
 	defer c.mu.Unlock()
 	if c.stopped() {
 		conn.Close()
-		return nil, ErrClientClosed
+		return nil, errClientClosed
 	}
 	c.conn = conn
 	return conn, nil
-}
-
-// start runs the read, ping and timeout goroutines for conn.
-func (c *Client) start(conn *websocket.Conn) {
-	// done and heartbeat belong to this connection only, so a reconnect
-	// starts the ping and timeout goroutines afresh.
-	done := make(chan struct{})
-	heartbeat := make(chan struct{}, 1)
-
-	go c.readPump(conn, done, heartbeat)
-	go c.pingPump(conn, done)
-	go c.timeoutMonitor(conn, done, heartbeat)
 }
 
 // buildURL constructs the WebSocket URL with query parameters
@@ -202,29 +238,40 @@ func (c *Client) buildURL() (string, error) {
 	return u.String(), nil
 }
 
-// readPump reads messages from one connection. It owns that connection's
-// lifetime: when a read fails it ends the connection and reconnects.
-func (c *Client) readPump(conn *websocket.Conn, done chan struct{}, heartbeat chan<- struct{}) {
+// serve reads from conn until it fails, alongside conn's ping and timeout
+// goroutines, which have stopped by the time it returns. It returns why the
+// connection ended, or nil if the client was closed.
+func (c *Client) serve(conn *websocket.Conn) error {
+	done := make(chan struct{})
+	heartbeat := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	var timedOut bool
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		c.pingPump(conn, done)
+	}()
+	go func() {
+		defer wg.Done()
+		timedOut = c.timeoutMonitor(conn, done, heartbeat)
+	}()
+
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			// Stop this connection's ping and timeout goroutines before a
-			// new connection starts its own.
 			conn.Close()
 			close(done)
+			wg.Wait()
 
 			if c.stopped() {
-				return
+				return nil
 			}
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
+			if timedOut {
+				return errors.New("connection timeout")
 			}
-			c.reportError(err)
-			c.reconnect()
-			return
+			return err
 		}
 
-		// Handle different message types
 		c.handleMessage(message, heartbeat)
 	}
 }
@@ -252,13 +299,13 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
 	if err != nil {
 		// Not meet-state JSON - treat as error message
 		log.Printf("error unmarshalling Liftingcast message: %s", err)
-		c.reportError(fmt.Errorf("server error: %s", msgStr))
+		c.setLastError(fmt.Sprintf("server error: %s", msgStr))
 		return
 	}
 
-	// Valid meet data update
+	// Valid meet state
 	select {
-	case c.dataUpdate <- json.RawMessage(message):
+	case c.messages <- json.RawMessage(message):
 	case <-c.stop:
 		return
 	}
@@ -276,7 +323,7 @@ func (c *Client) pingPump(conn *websocket.Conn, done <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			if err := sendPing(conn); err != nil {
-				// The failed write breaks the connection; readPump reconnects.
+				// The failed write breaks the connection; serve sees it.
 				log.Printf("Failed to send ping: %v", err)
 				return
 			}
@@ -293,8 +340,9 @@ func sendPing(conn *websocket.Conn) error {
 }
 
 // timeoutMonitor closes one connection if nothing arrives on it for
-// messageTimeout. Closing it makes readPump fail and reconnect.
-func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, heartbeat <-chan struct{}) {
+// messageTimeout, and reports whether it did. Closing it makes serve's read
+// fail.
+func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, heartbeat <-chan struct{}) bool {
 	timer := time.NewTimer(c.messageTimeout)
 	defer timer.Stop()
 
@@ -304,57 +352,25 @@ func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, hear
 			timer.Reset(c.messageTimeout)
 		case <-timer.C:
 			log.Println("Connection timeout - no messages received")
-			c.reportError(fmt.Errorf("connection timeout"))
 			conn.Close()
-			return
+			return true
 		case <-done:
-			return
+			return false
 		}
 	}
 }
 
-// reconnect retries Connect with exponential backoff, capped at maxBackoff,
-// until it succeeds or the client is closed.
-func (c *Client) reconnect() {
-	for {
-		log.Printf("Attempting to reconnect in %v", c.backoff)
-
-		select {
-		case <-time.After(c.backoff):
-		case <-c.stop:
-			log.Println("Reconnection stopped")
-			return
-		}
-
-		// Double the backoff for next attempt
-		c.backoff = min(c.backoff*2, c.maxBackoff)
-
-		conn, err := c.dial()
-		if err != nil {
-			if errors.Is(err, ErrClientClosed) {
-				return
-			}
-			log.Printf("Reconnection failed: %v", err)
-			continue
-		}
-
-		// Reset backoff before the new connection's readPump can start
-		// reconnecting on its own
-		c.backoff = c.initialBackoff
-		log.Println("Reconnected successfully")
-		c.start(conn)
-		return
-	}
+func (c *Client) setStatus(status ClientStatus) {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	c.status = status
 }
 
-// reportError sends err to Errors, dropping it if nobody is reading, so an
-// undrained Errors channel never stalls reconnection.
-func (c *Client) reportError(err error) {
-	select {
-	case c.errorChan <- err:
-	default:
-		log.Printf("Dropping LiftingCast error, Errors() is full: %v", err)
-	}
+// setLastError records err without changing whether the client is connected.
+func (c *Client) setLastError(err string) {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	c.status.LastError = err
 }
 
 func (c *Client) stopped() bool {
@@ -366,25 +382,35 @@ func (c *Client) stopped() bool {
 	}
 }
 
-// DataUpdate returns the channel for receiving meet data updates, each the
-// raw JSON of one message. Pass them to Cache.Merge to build the full state.
-func (c *Client) DataUpdate() <-chan json.RawMessage {
-	return c.dataUpdate
+// Status returns the client's connection status right now, even if meet
+// states sent before a change are still unread on Messages.
+func (c *Client) Status() ClientStatus {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	return c.status
 }
 
-// Errors returns the channel for receiving errors
-func (c *Client) Errors() <-chan error {
-	return c.errorChan
+// Messages returns the channel of meet state, each the raw JSON of one
+// message. Pass them to Cache.Merge to build the full state. It is closed
+// once the client is closed and nothing more can be sent on it.
+func (c *Client) Messages() <-chan json.RawMessage {
+	return c.messages
 }
 
 // Close closes the WebSocket connection and stops reconnecting. The client
 // cannot be reused afterwards.
 func (c *Client) Close() {
-	c.stopOnce.Do(func() { close(c.stop) })
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.stopped() {
+		return
+	}
+	close(c.stop)
+	c.setStatus(ClientStatus{})
 	if c.conn != nil {
 		c.conn.Close()
+	}
+	if !c.started {
+		close(c.messages)
 	}
 }

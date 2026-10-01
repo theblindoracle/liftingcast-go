@@ -85,41 +85,59 @@ func (s *fakeServer) accept(t *testing.T, within time.Duration) *websocket.Conn 
 }
 
 // newIdleTestClient returns a client with shortened timings that has not yet
-// connected. Tests may adjust its timings before calling Connect.
+// started. Tests may adjust its timings before calling Start.
 func newIdleTestClient(t *testing.T, url string, ping, timeout time.Duration) *Client {
 	t.Helper()
 	c := NewClient(url, "meet", "password", "key")
 	c.pingInterval = ping
 	c.messageTimeout = timeout
 	c.initialBackoff = 10 * time.Millisecond
-	c.backoff = c.initialBackoff
 	c.maxBackoff = time.Second
 	c.handshakeTimeout = time.Second
-
-	stopDraining := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-c.Errors():
-			case <-stopDraining:
-				return
-			}
-		}
-	}()
-	t.Cleanup(func() {
-		c.Close()
-		close(stopDraining)
-	})
+	t.Cleanup(c.Close)
 	return c
 }
 
 func newTestClient(t *testing.T, url string, ping, timeout time.Duration) *Client {
 	t.Helper()
 	c := newIdleTestClient(t, url, ping, timeout)
-	if err := c.Connect(); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	c.Start()
 	return c
+}
+
+// waitForStatus waits until the client's status satisfies ok.
+func waitForStatus(t *testing.T, c *Client, ok func(ClientStatus) bool) ClientStatus {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		status := c.Status()
+		if ok(status) {
+			return status
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status stayed %+v", status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestClientRetriesFailedFirstDial(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.down.Store(true)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+
+	srv.nextAttempt(t, time.Second)
+	status := waitForStatus(t, c, func(s ClientStatus) bool { return s.LastError != "" })
+	if status.Connected {
+		t.Errorf("status = %+v after a failed dial, want disconnected", status)
+	}
+
+	srv.down.Store(false)
+	srv.accept(t, time.Second)
+	status = waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+	if status.LastError != "" {
+		t.Errorf("status = %+v after connecting, want LastError cleared", status)
+	}
 }
 
 func TestClientSendsHeartbeatsAfterReconnect(t *testing.T) {
@@ -157,9 +175,7 @@ func TestClientReconnectBackoffStopsAtCap(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
 	c.maxBackoff = 40 * time.Millisecond
-	if err := c.Connect(); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	c.Start()
 	conn := srv.accept(t, time.Second)
 
 	srv.down.Store(true)
@@ -181,9 +197,7 @@ func TestClientReconnectsPromptlyAfterLongOutage(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
 	c.maxBackoff = 50 * time.Millisecond
-	if err := c.Connect(); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	c.Start()
 	conn := srv.accept(t, time.Second)
 
 	srv.down.Store(true)
@@ -194,13 +208,16 @@ func TestClientReconnectsPromptlyAfterLongOutage(t *testing.T) {
 	srv.accept(t, c.maxBackoff+150*time.Millisecond)
 }
 
-func TestClientDialFailsAtHandshakeTimeout(t *testing.T) {
-	// Accepts TCP connections but never answers the WebSocket handshake.
+// silentListener accepts TCP connections but never answers the WebSocket
+// handshake. Each accepted connection is sent on the returned channel.
+func silentListener(t *testing.T) (string, <-chan net.Conn) {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan net.Conn, 16)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -208,25 +225,42 @@ func TestClientDialFailsAtHandshakeTimeout(t *testing.T) {
 				return
 			}
 			t.Cleanup(func() { conn.Close() })
+			select {
+			case accepted <- conn:
+			default:
+			}
 		}
 	}()
+	return "ws://" + ln.Addr().String(), accepted
+}
 
-	c := newIdleTestClient(t, "ws://"+ln.Addr().String(), time.Hour, time.Hour)
+func TestClientDialFailsAtHandshakeTimeout(t *testing.T) {
+	url, _ := silentListener(t)
+	c := newIdleTestClient(t, url, time.Hour, time.Hour)
 	c.handshakeTimeout = 50 * time.Millisecond
+	c.initialBackoff = time.Hour
 
-	result := make(chan error, 1)
 	start := time.Now()
-	go func() { result <- c.Connect() }()
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("Connect succeeded against a server that never handshakes")
+	c.Start()
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.LastError != "" })
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("dial failed after %v, want about %v", elapsed, c.handshakeTimeout)
+	}
+}
+
+// waitForClosed waits for Messages to close, discarding anything left on it.
+func waitForClosed(t *testing.T, c *Client) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case _, ok := <-c.Messages():
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("Messages did not close after Close")
 		}
-		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-			t.Errorf("Connect failed after %v, want about %v", elapsed, c.handshakeTimeout)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Connect did not fail within 2s")
 	}
 }
 
@@ -234,16 +268,14 @@ func TestClientCloseDuringBackoffEndsReconnection(t *testing.T) {
 	srv := newFakeServer(t)
 	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
 	c.initialBackoff = 200 * time.Millisecond
-	c.backoff = c.initialBackoff
-	if err := c.Connect(); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	c.Start()
 	conn := srv.accept(t, time.Second)
 	srv.drainAttempts()
 
 	conn.Close()
 	time.Sleep(50 * time.Millisecond) // the client is now waiting out its backoff
 	c.Close()
+	waitForClosed(t, c)
 
 	select {
 	case <-srv.attempts:
@@ -253,62 +285,137 @@ func TestClientCloseDuringBackoffEndsReconnection(t *testing.T) {
 }
 
 func TestClientCloseDuringDialEndsReconnection(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		t.Cleanup(func() { conn.Close() })
-		accepted <- conn
-	}()
-
-	c := newIdleTestClient(t, "ws://"+ln.Addr().String(), time.Hour, time.Hour)
+	url, accepted := silentListener(t)
+	c := newIdleTestClient(t, url, time.Hour, time.Hour)
 	c.handshakeTimeout = time.Hour
-
-	result := make(chan error, 1)
-	go func() { result <- c.Connect() }()
+	c.Start()
 	select {
 	case <-accepted:
 	case <-time.After(time.Second):
 		t.Fatal("client did not dial")
 	}
-	c.Close()
 
-	select {
-	case err := <-result:
-		if err == nil {
-			t.Fatal("Connect succeeded after Close")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Close did not end a pending dial")
+	c.Close()
+	waitForClosed(t, c)
+	if status := c.Status(); status.Connected {
+		t.Errorf("status = %+v after Close during a dial, want disconnected", status)
 	}
 }
 
-func TestClientReportsNonObjectMessagesAsErrors(t *testing.T) {
+func TestClientCloseWhileStreamingClosesMessages(t *testing.T) {
 	srv := newFakeServer(t)
-	c := NewClient(srv.url, "meet", "password", "key")
-	t.Cleanup(c.Close)
-	if err := c.Connect(); err != nil {
-		t.Fatalf("connect: %v", err)
-	}
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
 	conn := srv.accept(t, time.Second)
+
+	// Fill Messages so the client is blocked handing on a state when it is
+	// closed.
+	go func() {
+		for {
+			if conn.WriteMessage(websocket.TextMessage, []byte(`{"name": "Test Meet"}`)) != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	c.Close()
+	waitForClosed(t, c)
+	if status := c.Status(); status.Connected {
+		t.Errorf("status = %+v after Close, want disconnected", status)
+	}
+}
+
+func TestClientCloseBeforeStartClosesMessages(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
+	c.Close()
+	c.Start()
+	waitForClosed(t, c)
+
+	select {
+	case <-srv.attempts:
+		t.Fatal("client dialled after Close")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestClientStartTwiceDialsOnce(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	c.Start()
+	srv.accept(t, time.Second)
+
+	select {
+	case <-srv.attempts:
+	default:
+		t.Fatal("no dial recorded")
+	}
+	select {
+	case <-srv.attempts:
+		t.Fatal("second Start dialled again")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestClientShowsDropBeforeQueuedMessagesAreRead(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
+	c.initialBackoff = time.Hour
+	c.Start()
+	conn := srv.accept(t, time.Second)
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+
+	for i := 0; i < 3; i++ {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"name": "Test Meet"}`)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	conn.Close()
+
+	status := waitForStatus(t, c, func(s ClientStatus) bool { return !s.Connected })
+	if status.LastError == "" {
+		t.Errorf("status = %+v after a drop, want LastError set", status)
+	}
+	if n := len(c.Messages()); n != 3 {
+		t.Errorf("%d messages queued, want the 3 sent before the drop still unread", n)
+	}
+}
+
+func TestClientClearsLastErrorOnReconnect(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	conn := srv.accept(t, time.Second)
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+
+	srv.down.Store(true)
+	conn.Close()
+	waitForStatus(t, c, func(s ClientStatus) bool { return !s.Connected && s.LastError != "" })
+
+	srv.down.Store(false)
+	srv.accept(t, time.Second)
+	status := waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+	if status.LastError != "" {
+		t.Errorf("status = %+v after reconnecting, want LastError cleared", status)
+	}
+}
+
+func TestClientStaysConnectedOnServerError(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	conn := srv.accept(t, time.Second)
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
 
 	for _, raw := range []string{`null`, `[1]`, `not json`} {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(raw)); err != nil {
 			t.Fatalf("send: %v", err)
 		}
-		select {
-		case <-c.Errors():
-		case m := <-c.DataUpdate():
-			t.Fatalf("DataUpdate got %s, want it reported on Errors", m)
-		case <-time.After(time.Second):
-			t.Fatalf("message %s was neither reported nor passed on", raw)
+		status := waitForStatus(t, c, func(s ClientStatus) bool { return strings.Contains(s.LastError, raw) })
+		if !status.Connected {
+			t.Errorf("status = %+v after server error %s, want still connected", status, raw)
 		}
+	}
+	select {
+	case m := <-c.Messages():
+		t.Errorf("Messages got %s, want server errors kept off it", m)
+	default:
 	}
 }

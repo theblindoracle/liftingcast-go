@@ -21,11 +21,10 @@ Without a `Hub`, merge the `Client`'s raw messages into a `Cache` yourself:
 
 ```go
 client := liftingcast.NewClient(baseURL, meetID, password, apiKey)
-if err := client.Connect(); err != nil {
-	return err
-}
+client.Start() // keeps retrying until Close
+defer client.Close()
 cache := liftingcast.NewCache()
-for raw := range client.DataUpdate() {
+for raw := range client.Messages() { // closed by Close
 	state, err := cache.Merge(raw)
 	if err != nil {
 		continue
@@ -33,5 +32,7 @@ for raw := range client.DataUpdate() {
 	// state is the full merged meet state, yours to modify
 }
 ```
+
+`client.Status()` reports whether the connection is up right now and the last error it saw.
 
 The API is unstable until v1.
