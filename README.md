@@ -5,7 +5,7 @@
 Go client for the LiftingCast meet-state WebSocket API.
 
 - `Client` dials the WebSocket, sends heartbeats, detects silent connections and reconnects with backoff.
-- `Cache` merges partial messages into one meet state.
+- `Cache` builds one meet state from LiftingCast's messages; each section a message carries replaces the cached copy.
 - `Hub` keeps an upstream connection alive, merges into a `Cache` and hands each merged state to in-process `BackendListener`s.
 - `MeetApiResponse` and friends are the meet-state types, with `NullableFloat64` for LiftingCast's loosely typed numbers.
 
