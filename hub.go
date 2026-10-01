@@ -248,32 +248,40 @@ func (h *Hub) maintainUpstreamConnection(client *Client, done <-chan struct{}) {
 	}
 }
 
-// broadcastToBackendListeners sends meet data to all registered backend listeners
+// broadcastToBackendListeners queues meet data for all registered backend listeners
 func (h *Hub) broadcastToBackendListeners(data *MeetApiResponse) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	for _, listener := range h.backendListeners {
-		// Call handler in goroutine to avoid blocking the broadcast
-		// and to allow each listener to process data independently
-		go listener.Handler(data)
+		listener.enqueue(data)
 	}
 }
 
-// registerBackendListener registers a new backend listener
+// registerBackendListener registers a new backend listener and starts
+// delivering to it, beginning with the cached state if there is one
 func (h *Hub) registerBackendListener(listener *BackendListener) {
 	h.mu.Lock()
+	previous, replaced := h.backendListeners[listener.ID]
+	if replaced && previous == listener {
+		h.mu.Unlock()
+		return
+	}
+	if replaced {
+		previous.Close()
+	}
 	h.backendListeners[listener.ID] = listener
 	count := len(h.backendListeners)
+
+	// Queue the cached state before the listener can see any later broadcast
+	if cachedData := h.cache.Get(); cachedData != nil {
+		listener.enqueue(cachedData)
+		log.Printf("Queued cached data for backend listener: %s", listener.ID)
+	}
+	listener.start()
 	h.mu.Unlock()
 
 	log.Printf("Backend listener registered: %s (total listeners: %d)", listener.ID, count)
-
-	// Send cached data to the new listener immediately
-	if cachedData := h.cache.Get(); cachedData != nil {
-		go listener.Handler(cachedData)
-		log.Printf("Sent cached data to backend listener: %s", listener.ID)
-	}
 }
 
 // unregisterBackendListener removes a backend listener
