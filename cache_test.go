@@ -41,10 +41,10 @@ func TestCacheMergeOfPlatformsOnlyMessageKeepsLifters(t *testing.T) {
 		"platforms": {"p1": {"id": "p1", "name": "Platform 1", "clockState": "started", "currentAttempt": {"id": "a1", "liftName": "squat", "attemptNumber": "1", "lifter": {"id": "l1"}}}}
 	}`)
 
-	if merged.Lifters == nil || len(*merged.Lifters) != 2 {
+	if merged.Lifters == nil || len(merged.Lifters) != 2 {
 		t.Fatalf("lifters = %v, want both lifters kept", merged.Lifters)
 	}
-	alice := (*merged.Lifters)["l1"]
+	alice := merged.Lifters["l1"]
 	if alice.Name == nil || *alice.Name != "Alice" {
 		t.Errorf("lifter l1 name = %v, want Alice", alice.Name)
 	}
@@ -52,7 +52,7 @@ func TestCacheMergeOfPlatformsOnlyMessageKeepsLifters(t *testing.T) {
 		t.Errorf("lifter l1 squat 1 weight = %v, want 100", w)
 	}
 
-	p1 := (*merged.Platforms)["p1"]
+	p1 := merged.Platforms["p1"]
 	if p1.ClockState == nil || *p1.ClockState != ClockStarted {
 		t.Errorf("platform clockState = %v, want started", p1.ClockState)
 	}
@@ -60,7 +60,7 @@ func TestCacheMergeOfPlatformsOnlyMessageKeepsLifters(t *testing.T) {
 		t.Errorf("platform currentAttempt = %v, want a1", p1.CurrentAttempt)
 	}
 
-	if got := cache.Get(); got.Lifters == nil || len(*got.Lifters) != 2 {
+	if got := cache.Get(); got.Lifters == nil || len(got.Lifters) != 2 {
 		t.Errorf("Get() lifters = %v, want both lifters kept", got.Lifters)
 	}
 }
@@ -71,7 +71,7 @@ func TestCacheMergeReplacesSectionWhole(t *testing.T) {
 
 	merged := mustMerge(t, cache, `{"platforms": {"p1": {"id": "p1", "clockState": "started"}}}`)
 
-	p1 := (*merged.Platforms)["p1"]
+	p1 := merged.Platforms["p1"]
 	if p1.ClockState == nil || *p1.ClockState != ClockStarted {
 		t.Errorf("platform clockState = %v, want started", p1.ClockState)
 	}
@@ -88,7 +88,7 @@ func TestCacheMergeDoesNotCarryRefereeCardsOver(t *testing.T) {
 	merged := mustMerge(t, cache, `{"platforms": {"p1": {"id": "p1",
 		"refLights": {"left": {"decision": "bad", "cards": {"blue": true}}}}}}`)
 
-	cards := (*merged.Platforms)["p1"].RefLights.Left.Cards
+	cards := merged.Platforms["p1"].RefLights.Left.Cards
 	if cards == nil || cards.Red != nil || cards.Blue == nil || !*cards.Blue {
 		t.Errorf("left cards = %+v, want only blue", cards)
 	}
@@ -117,14 +117,14 @@ func TestCacheMergeReturnsCopy(t *testing.T) {
 		merged := mustMerge(t, cache, raw)
 		want := merged.Name
 		merged.Name = "Mutated"
-		(*merged.Lifters)["l1"] = Lifter{ID: "mutated"}
+		merged.Lifters["l1"] = Lifter{ID: "mutated"}
 
 		got := cache.Get()
 		if got.Name != want {
 			t.Errorf("Get().Name = %q after mutating Merge's result, want %q", got.Name, want)
 		}
-		if (*got.Lifters)["l1"].ID != "l1" {
-			t.Errorf("Get() lifter l1 = %v after mutating Merge's result", (*got.Lifters)["l1"])
+		if got.Lifters["l1"].ID != "l1" {
+			t.Errorf("Get() lifter l1 = %v after mutating Merge's result", got.Lifters["l1"])
 		}
 	}
 }
@@ -139,7 +139,7 @@ func TestCacheMergeReplacesIfSuccessfulMapsWhole(t *testing.T) {
 		"ifSuccessfulScores": {"l3": 200},
 		"ifSuccessfulPlaces": {"l3": 3}}}}}`)
 
-	ca := (*merged.Platforms)["p1"].CurrentAttempt
+	ca := merged.Platforms["p1"].CurrentAttempt
 	if ca == nil {
 		t.Fatal("currentAttempt = nil")
 	}
@@ -157,7 +157,7 @@ func TestCacheMergeOfEmptyMapReplaces(t *testing.T) {
 
 	merged := mustMerge(t, cache, `{"lifters": {}}`)
 
-	if merged.Lifters == nil || len(*merged.Lifters) != 0 {
+	if merged.Lifters == nil || len(merged.Lifters) != 0 {
 		t.Errorf("lifters = %v, want empty", merged.Lifters)
 	}
 }
@@ -211,10 +211,10 @@ func TestCacheMergeDropsLifterDeletedUpstream(t *testing.T) {
 		"platforms": {"p1": {"id": "p1", "name": "Platform 1", "clockState": "initial"}}
 	}`)
 
-	if _, ok := (*merged.Lifters)["l2"]; ok {
+	if _, ok := merged.Lifters["l2"]; ok {
 		t.Errorf("lifter l2 still in meet state after LiftingCast deleted it")
 	}
-	if _, ok := (*merged.Lifters)["l1"]; !ok {
+	if _, ok := merged.Lifters["l1"]; !ok {
 		t.Errorf("lifter l1 missing, want it kept")
 	}
 }
@@ -235,10 +235,10 @@ func TestCacheMergeDropsDivisionDeletedUpstream(t *testing.T) {
 		}
 	}`)
 
-	if _, ok := (*merged.Divisions)["d2"]; ok {
+	if _, ok := merged.Divisions["d2"]; ok {
 		t.Errorf("division d2 still in meet state after LiftingCast deleted it")
 	}
-	if _, ok := (*merged.Divisions)["d1"]; !ok {
+	if _, ok := merged.Divisions["d1"]; !ok {
 		t.Errorf("division d1 missing, want it kept")
 	}
 }
@@ -260,7 +260,7 @@ func TestCacheMergeDropsWeightClassDeletedUpstream(t *testing.T) {
 		}
 	}`)
 
-	wcs := (*merged.Divisions)["d1"].WeightClasses
+	wcs := merged.Divisions["d1"].WeightClasses
 	if _, ok := wcs["w2"]; ok {
 		t.Errorf("weight class w2 still in division d1 after LiftingCast deleted it")
 	}
@@ -319,13 +319,13 @@ func TestCacheReplayOfRecordedDeletesDropsThem(t *testing.T) {
 		t.Error("meet state differs from the latest copy of each section")
 	}
 	// See the recording's .md for the scenarios behind these IDs.
-	if _, ok := (*merged.Lifters)["lvoirlq9n8to"]; ok {
+	if _, ok := merged.Lifters["lvoirlq9n8to"]; ok {
 		t.Error("deleted Lifter 53 still in meet state")
 	}
-	if _, ok := (*merged.Divisions)["dzczfssal7y5"]; ok {
+	if _, ok := merged.Divisions["dzczfssal7y5"]; ok {
 		t.Error("deleted division Men's Masters still in meet state")
 	}
-	if _, ok := (*merged.Lifters)["lx122y85a58z"]; !ok {
+	if _, ok := merged.Lifters["lx122y85a58z"]; !ok {
 		t.Error("Lifter 55 missing, want them kept")
 	}
 }
@@ -336,10 +336,10 @@ func TestCacheReplayOfRecordedMeetMerges(t *testing.T) {
 	if !reflect.DeepEqual(merged, latest) {
 		t.Error("meet state differs from the latest copy of each section")
 	}
-	if merged.Platforms == nil || len(*merged.Platforms) != 2 {
+	if merged.Platforms == nil || len(merged.Platforms) != 2 {
 		t.Errorf("platforms = %v, want two", merged.Platforms)
 	}
-	if merged.Teams == nil || len(*merged.Teams) == 0 {
+	if merged.Teams == nil || len(merged.Teams) == 0 {
 		t.Error("no teams after replaying the recording")
 	}
 }
@@ -350,7 +350,7 @@ func TestCacheMergeDecodesTeams(t *testing.T) {
 	merged := mustMerge(t, cache, `{"teams": {"Men-Beltless Hero Academia": {"place": 1, "points": 9}}}`)
 
 	want := Teams{"Men-Beltless Hero Academia": {Place: 1, Points: 9}}
-	if merged.Teams == nil || !reflect.DeepEqual(*merged.Teams, want) {
+	if merged.Teams == nil || !reflect.DeepEqual(merged.Teams, want) {
 		t.Errorf("teams = %v, want %v", merged.Teams, want)
 	}
 }

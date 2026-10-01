@@ -79,8 +79,8 @@ type LifterLifts map[LiftName]LifterAttempts
 type LifterDivision struct {
 	DivisionID      *string         `json:"divisionId"`
 	WeightClassID   *string         `json:"weightClassId"`
-	Score           interface{}     `json:"score"` // string | number | null
-	ForecastedScore interface{}     `json:"forecastedScore"`
+	Score           NullableFloat64 `json:"score"`
+	ForecastedScore NullableFloat64 `json:"forecastedScore"`
 	Place           *int            `json:"place"`
 	ForecastedPlace *int            `json:"forecastedPlace"`
 	Total           NullableFloat64 `json:"total"`
@@ -186,11 +186,11 @@ type Teams map[string]TeamData
 
 // MeetState represents the complete meet state from LiftingCast API
 type MeetState struct {
-	Name       string     `json:"name"`
-	Units      *string    `json:"units"` // "KG" | "LBS" | null
-	Federation string     `json:"federation"`
-	Lifters    *Lifters   `json:"lifters,omitempty"`
-	Platforms  *Platforms `json:"platforms,omitempty"`
-	Divisions  *Divisions `json:"divisions,omitempty"`
-	Teams      *Teams     `json:"teams,omitempty"`
+	Name       string    `json:"name"`
+	Units      *string   `json:"units"` // "KG" | "LBS" | null
+	Federation string    `json:"federation"`
+	Lifters    Lifters   `json:"lifters,omitempty"`
+	Platforms  Platforms `json:"platforms,omitempty"`
+	Divisions  Divisions `json:"divisions,omitempty"`
+	Teams      Teams     `json:"teams,omitempty"`
 }

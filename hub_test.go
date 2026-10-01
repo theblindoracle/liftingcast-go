@@ -34,11 +34,11 @@ func TestHubHandsMergedStateToListeners(t *testing.T) {
 	for {
 		select {
 		case m := <-states:
-			p1 := (*m.Platforms)["p1"]
+			p1 := m.Platforms["p1"]
 			if p1.ClockState == nil || *p1.ClockState != ClockStarted {
 				continue
 			}
-			if m.Lifters == nil || (*m.Lifters)["l1"].ID != "l1" {
+			if m.Lifters == nil || m.Lifters["l1"].ID != "l1" {
 				t.Fatalf("merged state lost lifters: %v", m.Lifters)
 			}
 			if !hub.Status().Connected {
@@ -149,7 +149,7 @@ func newLotRecorder() *lotRecorder {
 }
 
 func (r *lotRecorder) handle(m *MeetState) {
-	lot := *(*m.Lifters)["l1"].Lot
+	lot := *m.Lifters["l1"].Lot
 	r.mu.Lock()
 	r.lots = append(r.lots, lot)
 	r.mu.Unlock()
