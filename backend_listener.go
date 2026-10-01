@@ -10,6 +10,10 @@ type BackendListenerHandler func(*MeetApiResponse)
 // Once registered with a Hub, the listener has its own unbounded queue and
 // goroutine: Handler is called with one state at a time, in the order the Hub
 // produced them, and a slow Handler delays only its own listener.
+//
+// A listener is single-use: once it is unregistered or closed it cannot be
+// registered again, and the Hub ignores any attempt to do so. To listen
+// again, create a new one with NewBackendListener.
 type BackendListener struct {
 	ID      string
 	Handler BackendListenerHandler

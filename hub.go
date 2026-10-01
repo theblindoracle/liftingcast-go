@@ -262,6 +262,13 @@ func (h *Hub) broadcastToBackendListeners(data *MeetApiResponse) {
 // delivering to it, beginning with the cached state if there is one. A
 // listener it replaces under the same ID is closed.
 func (h *Hub) registerBackendListener(listener *BackendListener) {
+	select {
+	case <-listener.Done:
+		log.Printf("Ignoring registration of closed backend listener: %s", listener.ID)
+		return
+	default:
+	}
+
 	h.mu.Lock()
 	previous, replaced := h.backendListeners[listener.ID]
 	if replaced && previous == listener {

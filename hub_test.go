@@ -239,3 +239,18 @@ func TestHubUnregisteringReplacedListenerKeepsItsReplacement(t *testing.T) {
 	send(0)
 	rec.waitFor(t, 0)
 }
+
+func TestHubIgnoresReregisteredUnregisteredListener(t *testing.T) {
+	hub, send := startHub(t)
+	dead := NewBackendListener("same", func(*MeetApiResponse) {})
+	hub.RegisterBackendListener() <- dead
+	hub.UnregisterBackendListener() <- dead
+	<-dead.Done
+
+	rec := newLotRecorder()
+	hub.RegisterBackendListener() <- NewBackendListener("same", rec.handle)
+	hub.RegisterBackendListener() <- dead
+
+	send(0)
+	rec.waitFor(t, 0)
+}
