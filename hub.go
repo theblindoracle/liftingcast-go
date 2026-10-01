@@ -17,6 +17,7 @@ type ReconnectRequest struct {
 // ConnectionStatus is the Client's ClientStatus plus the meet it is for
 type ConnectionStatus struct {
 	Connected bool   `json:"connected"`
+	Rejected  bool   `json:"rejected"`
 	MeetID    string `json:"meetId"`
 	MeetName  string `json:"meetName"`
 	Error     string `json:"error,omitempty"`
@@ -118,6 +119,7 @@ func (h *Hub) GetStatus() ConnectionStatus {
 	}
 	status := ConnectionStatus{
 		Connected: clientStatus.Connected,
+		Rejected:  clientStatus.Rejected,
 		MeetID:    meetID,
 		Error:     clientStatus.LastError,
 	}

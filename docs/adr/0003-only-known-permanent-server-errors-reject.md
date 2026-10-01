@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Only errors known to be permanent stop the client reconnecting

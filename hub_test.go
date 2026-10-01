@@ -300,13 +300,7 @@ func TestHubReportsDisconnectedAfterDropEvenWithStatesQueued(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 	conn.Close()
-	deadline := time.Now().Add(time.Second)
-	for hub.GetStatus().Connected {
-		if time.Now().After(deadline) {
-			t.Fatal("hub never noticed the dropped connection")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitForHubStatus(t, hub, func(s ConnectionStatus) bool { return !s.Connected })
 
 	rec := newLotRecorder()
 	go hub.Run()
@@ -315,5 +309,34 @@ func TestHubReportsDisconnectedAfterDropEvenWithStatesQueued(t *testing.T) {
 
 	if status := hub.GetStatus(); status.Connected {
 		t.Errorf("status = %+v after the drop, want disconnected until the client reconnects", status)
+	}
+}
+
+func TestHubReportsRejection(t *testing.T) {
+	srv := newFakeServer(t)
+	hub := NewHub(srv.url, "meet", "password", "key")
+	go hub.Run()
+	t.Cleanup(hub.Disconnect)
+	replay(t, srv.accept(t, time.Second), loadRecording(t, "lc-wrong-password-hosted.jsonl")[0])
+
+	status := waitForHubStatus(t, hub, func(s ConnectionStatus) bool { return s.Rejected })
+	if status.Connected || status.Error != "server error: "+badCredentialsError {
+		t.Errorf("status = %+v, want disconnected with the server error", status)
+	}
+}
+
+// waitForHubStatus waits until the hub's status satisfies ok.
+func waitForHubStatus(t *testing.T, hub *Hub, ok func(ConnectionStatus) bool) ConnectionStatus {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		status := hub.GetStatus()
+		if ok(status) {
+			return status
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status stayed %+v", status)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -1,9 +1,14 @@
 package liftingcast
 
 import (
+	"bufio"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,13 +19,13 @@ import (
 
 // fakeServer stands in for LiftingCast. Each accepted connection is handed to
 // the test on conns, and the test decides what the server does with it.
-// While down is set, every connection attempt is refused. Each attempt's time
-// is recorded on attempts.
+// While refuse holds an HTTP status, every handshake is refused with it. Each
+// attempt's time is recorded on attempts.
 type fakeServer struct {
 	url      string
 	conns    chan *websocket.Conn
 	attempts chan time.Time
-	down     atomic.Bool
+	refuse   atomic.Int32
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -35,8 +40,8 @@ func newFakeServer(t *testing.T) *fakeServer {
 		case s.attempts <- time.Now():
 		default:
 		}
-		if s.down.Load() {
-			http.Error(w, "down", http.StatusServiceUnavailable)
+		if status := int(s.refuse.Load()); status != 0 {
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -58,6 +63,18 @@ func (s *fakeServer) drainAttempts() {
 		default:
 			return
 		}
+	}
+}
+
+// expectNoAttempt fails if the client tries to connect within d, ignoring
+// attempts recorded so far.
+func (s *fakeServer) expectNoAttempt(t *testing.T, d time.Duration) {
+	t.Helper()
+	s.drainAttempts()
+	select {
+	case <-s.attempts:
+		t.Fatal("client tried to connect again")
+	case <-time.After(d):
 	}
 }
 
@@ -123,7 +140,7 @@ func waitForStatus(t *testing.T, c *Client, ok func(ClientStatus) bool) ClientSt
 
 func TestClientRetriesFailedFirstDial(t *testing.T) {
 	srv := newFakeServer(t)
-	srv.down.Store(true)
+	srv.refuse.Store(http.StatusServiceUnavailable)
 	c := newTestClient(t, srv.url, time.Hour, time.Hour)
 
 	srv.nextAttempt(t, time.Second)
@@ -132,7 +149,7 @@ func TestClientRetriesFailedFirstDial(t *testing.T) {
 		t.Errorf("status = %+v after a failed dial, want disconnected", status)
 	}
 
-	srv.down.Store(false)
+	srv.refuse.Store(0)
 	srv.accept(t, time.Second)
 	status = waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
 	if status.LastError != "" {
@@ -178,7 +195,7 @@ func TestClientReconnectBackoffStopsAtCap(t *testing.T) {
 	c.Start()
 	conn := srv.accept(t, time.Second)
 
-	srv.down.Store(true)
+	srv.refuse.Store(http.StatusServiceUnavailable)
 	srv.drainAttempts()
 	conn.Close()
 
@@ -200,10 +217,10 @@ func TestClientReconnectsPromptlyAfterLongOutage(t *testing.T) {
 	c.Start()
 	conn := srv.accept(t, time.Second)
 
-	srv.down.Store(true)
+	srv.refuse.Store(http.StatusServiceUnavailable)
 	conn.Close()
 	time.Sleep(time.Second)
-	srv.down.Store(false)
+	srv.refuse.Store(0)
 
 	srv.accept(t, c.maxBackoff+150*time.Millisecond)
 }
@@ -245,6 +262,21 @@ func TestClientDialFailsAtHandshakeTimeout(t *testing.T) {
 	waitForStatus(t, c, func(s ClientStatus) bool { return s.LastError != "" })
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Errorf("dial failed after %v, want about %v", elapsed, c.handshakeTimeout)
+	}
+}
+
+// drainMessages discards meet state until Messages closes.
+func drainMessages(c *Client) {
+	for range c.Messages() {
+	}
+}
+
+// expectDoubledBackoff fails unless the gap before the client's attempt n
+// (counting from 0) was at least the backoff doubled once per earlier failure.
+func expectDoubledBackoff(t *testing.T, c *Client, n int, gap time.Duration) {
+	t.Helper()
+	if want := c.initialBackoff << (n - 1); gap < want {
+		t.Errorf("gap before connection %d = %v, want at least %v", n+1, gap, want)
 	}
 }
 
@@ -386,11 +418,11 @@ func TestClientClearsLastErrorOnReconnect(t *testing.T) {
 	conn := srv.accept(t, time.Second)
 	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
 
-	srv.down.Store(true)
+	srv.refuse.Store(http.StatusServiceUnavailable)
 	conn.Close()
 	waitForStatus(t, c, func(s ClientStatus) bool { return !s.Connected && s.LastError != "" })
 
-	srv.down.Store(false)
+	srv.refuse.Store(0)
 	srv.accept(t, time.Second)
 	status := waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
 	if status.LastError != "" {
@@ -417,5 +449,265 @@ func TestClientStaysConnectedOnServerError(t *testing.T) {
 	case m := <-c.Messages():
 		t.Errorf("Messages got %s, want server errors kept off it", m)
 	default:
+	}
+}
+
+// recordedEvent is one line of a recording from testdata/: meet state the
+// server sent (Msg), a message that isn't JSON (Event "text"), or how the
+// connection ended.
+type recordedEvent struct {
+	Conn  int             `json:"conn"`
+	Event string          `json:"event"`
+	Text  string          `json:"text"`
+	Msg   json.RawMessage `json:"msg"`
+}
+
+// loadRecording reads a recording from testdata/ and returns each recorded
+// connection's events in order.
+func loadRecording(t *testing.T, name string) [][]recordedEvent {
+	t.Helper()
+	f, err := os.Open(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	var conns [][]recordedEvent
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(nil, 1<<20)
+	for line := 1; scanner.Scan(); line++ {
+		var ev recordedEvent
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			t.Fatalf("%s line %d: %v", name, line, err)
+		}
+		for len(conns) < ev.Conn {
+			conns = append(conns, nil)
+		}
+		conns[ev.Conn-1] = append(conns[ev.Conn-1], ev)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return conns
+}
+
+// replay plays the server's side of one recorded connection on conn: it
+// sends what LiftingCast sent and ends the connection the way LiftingCast
+// did. A connection that was never ended is left open.
+func replay(t *testing.T, conn *websocket.Conn, events []recordedEvent) {
+	t.Helper()
+	for _, ev := range events {
+		var err error
+		switch {
+		case ev.Msg != nil:
+			err = conn.WriteMessage(websocket.TextMessage, ev.Msg)
+		case ev.Event == "text":
+			err = conn.WriteMessage(websocket.TextMessage, []byte(ev.Text))
+		case ev.Event == "read_error":
+			// Dropped without a close frame
+			conn.NetConn().Close()
+		case ev.Event == "close":
+			conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(1000, ev.Text))
+			conn.Close()
+		}
+		if err != nil {
+			t.Fatalf("replay %s: %v", ev.Event, err)
+		}
+	}
+}
+
+const (
+	badCredentialsError = "Error: unauthorized - meet id or password in auth param are incorrect"
+	badAPIKeyError      = "Error: invalid api key"
+	takeoverError       = "Another websocket connection was established. This connection is closing. You are only allowed to open one connection at a time."
+)
+
+func TestClientRejectedByRecordedPermanentServerError(t *testing.T) {
+	for _, tc := range []struct{ recording, message string }{
+		{"lc-wrong-meet-id-hosted.jsonl", badCredentialsError},
+		{"lc-wrong-meet-id-selfhosted.jsonl", badCredentialsError},
+		{"lc-wrong-password-hosted.jsonl", badCredentialsError},
+		{"lc-wrong-password-selfhosted.jsonl", badCredentialsError},
+		{"lc-wrong-api-key-hosted.jsonl", badAPIKeyError},
+	} {
+		t.Run(tc.recording, func(t *testing.T) {
+			conns := loadRecording(t, tc.recording)
+			srv := newFakeServer(t)
+			c := newTestClient(t, srv.url, time.Hour, time.Hour)
+			replay(t, srv.accept(t, time.Second), conns[0])
+
+			status := waitForStatus(t, c, func(s ClientStatus) bool { return s.Rejected })
+			if status.Connected || !strings.Contains(status.LastError, tc.message) {
+				t.Errorf("status = %+v, want disconnected with LastError %q", status, tc.message)
+			}
+			srv.expectNoAttempt(t, 200*time.Millisecond)
+			if status := c.Status(); !status.Rejected {
+				t.Errorf("status = %+v later, want still rejected", status)
+			}
+		})
+	}
+}
+
+func TestClientRejectedByRefusedHandshake(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := newFakeServer(t)
+			srv.refuse.Store(int32(code))
+			c := newTestClient(t, srv.url, time.Hour, time.Hour)
+
+			status := waitForStatus(t, c, func(s ClientStatus) bool { return s.Rejected })
+			if status.Connected || !strings.Contains(status.LastError, strconv.Itoa(code)) {
+				t.Errorf("status = %+v, want disconnected with LastError naming %d", status, code)
+			}
+			srv.expectNoAttempt(t, 200*time.Millisecond)
+		})
+	}
+}
+
+func TestClientClosesRejectedConnectionItself(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	conn := srv.accept(t, time.Second)
+
+	// Send the error but leave the connection open
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(badAPIKeyError)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Rejected })
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				t.Fatal("client left the rejected connection open")
+			}
+			return
+		}
+	}
+}
+
+func TestClientKeepsMessagesOpenWhenRejected(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	replay(t, srv.accept(t, time.Second), loadRecording(t, "lc-wrong-api-key-hosted.jsonl")[0])
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Rejected })
+
+	select {
+	case _, ok := <-c.Messages():
+		if !ok {
+			t.Fatal("Messages closed when the client was rejected, want it open until Close")
+		}
+		t.Fatal("Messages got meet state from a rejected connection")
+	case <-time.After(100 * time.Millisecond):
+	}
+	c.Close()
+	waitForClosed(t, c)
+}
+
+func TestClientIgnoresWrongAPIKeyOnSelfHosted(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	replay(t, srv.accept(t, time.Second), loadRecording(t, "lc-wrong-api-key-selfhosted.jsonl")[0])
+
+	select {
+	case <-c.Messages():
+	case <-time.After(time.Second):
+		t.Fatal("no meet state")
+	}
+	if status := c.Status(); !status.Connected || status.Rejected || status.LastError != "" {
+		t.Errorf("status = %+v, want connected with no error", status)
+	}
+}
+
+func TestClientKeepsRetryingAfterRecordedTakeover(t *testing.T) {
+	for _, recording := range []string{"lc-two-conns-A-hosted.jsonl", "lc-two-conns-B-hosted.jsonl"} {
+		t.Run(recording, func(t *testing.T) {
+			conns := loadRecording(t, recording)
+			srv := newFakeServer(t)
+			c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
+			c.initialBackoff = 20 * time.Millisecond
+			c.Start()
+			go drainMessages(c)
+
+			// Each connection gets meet state and is then pushed off, so none
+			// of them resets the backoff: the gaps keep doubling. The last
+			// connection B made was never pushed off.
+			var prev time.Time
+			for i, events := range conns {
+				at := srv.nextAttempt(t, time.Second)
+				if i > 0 {
+					expectDoubledBackoff(t, c, i, at.Sub(prev))
+				}
+				prev = at
+				conn := srv.accept(t, time.Second)
+				waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+				replay(t, conn, events)
+				if events[len(events)-1].Event != "read_error" {
+					time.Sleep(50 * time.Millisecond)
+					if status := c.Status(); !status.Connected || status.LastError != "" {
+						t.Errorf("status = %+v on the connection that was kept, want connected", status)
+					}
+					continue
+				}
+				status := waitForStatus(t, c, func(s ClientStatus) bool { return !s.Connected })
+				if status.Rejected || status.LastError != "server error: "+takeoverError {
+					t.Errorf("status = %+v after takeover %d, want not rejected and the takeover as LastError", status, i+1)
+				}
+			}
+		})
+	}
+}
+
+func TestClientResetsBackoffOnlyAfterMeetStateWithoutServerError(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
+	c.initialBackoff = 20 * time.Millisecond
+	c.Start()
+	go drainMessages(c)
+
+	// Connections that deliver no meet state don't reset the backoff
+	var prev time.Time
+	for i := 0; i < 4; i++ {
+		at := srv.nextAttempt(t, time.Second)
+		if i > 0 {
+			expectDoubledBackoff(t, c, i, at.Sub(prev))
+		}
+		prev = at
+		srv.accept(t, time.Second).Close()
+	}
+
+	// One that delivers meet state and drops without a server error does
+	srv.nextAttempt(t, time.Second)
+	conn := srv.accept(t, time.Second)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"name": "Test Meet"}`)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+	time.Sleep(20 * time.Millisecond)
+	dropped := time.Now()
+	conn.NetConn().Close()
+	if gap := srv.nextAttempt(t, time.Second).Sub(dropped); gap > 4*c.initialBackoff {
+		t.Errorf("reconnected %v after a connection that delivered meet state dropped, want about %v", gap, c.initialBackoff)
+	}
+}
+
+func TestClientForgetsServerErrorFollowedByMeetState(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newIdleTestClient(t, srv.url, time.Hour, time.Hour)
+	c.initialBackoff = time.Hour
+	c.Start()
+	conn := srv.accept(t, time.Second)
+	waitForStatus(t, c, func(s ClientStatus) bool { return s.Connected })
+
+	for _, raw := range []string{`not json`, `{"name": "Test Meet"}`} {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(raw)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	<-c.Messages()
+	conn.NetConn().Close()
+
+	status := waitForStatus(t, c, func(s ClientStatus) bool { return !s.Connected })
+	if strings.Contains(status.LastError, "not json") {
+		t.Errorf("status = %+v after the drop, want the drop as LastError, not a server error meet state followed", status)
 	}
 }

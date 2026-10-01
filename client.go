@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -38,19 +39,40 @@ const (
 // errClientClosed is returned by dial after Close has been called.
 var errClientClosed = errors.New("liftingcast: client closed")
 
+// rejectedError is the error that rejected the client: a handshake refused
+// as unauthorized or forbidden, or a server error known to be permanent.
+type rejectedError struct{ error }
+
+func isRejected(err error) bool {
+	var rejected rejectedError
+	return errors.As(err, &rejected)
+}
+
+// permanentServerErrors are the server errors that reject the client, exactly
+// as LiftingCast words them (see ADR-0003). Any other server error is
+// temporary.
+var permanentServerErrors = map[string]bool{
+	"Error: invalid api key": true,
+	"Error: unauthorized - meet id or password in auth param are incorrect": true,
+}
+
 // ClientStatus is the connection status of a Client: whether it is connected
-// right now, and the most recent error it saw. Connected means LiftingCast
-// accepted the connection, not that the credentials are known to be good.
+// right now, whether it has been rejected, and the most recent error it saw.
+// Connected means LiftingCast accepted the connection, not that the
+// credentials are known to be good. A rejected client stays rejected and
+// never reconnects; replace it.
 type ClientStatus struct {
 	Connected bool
+	Rejected  bool
 	LastError string
 }
 
 // Client is the upstream connection to LiftingCast for one meet.
 //
 // Once started it dials, and redials with backoff whenever a dial fails or a
-// connection drops or times out, until Close is called. Each connection gets
-// its own ping and timeout goroutines, which stop when that connection ends.
+// connection drops or times out, until Close is called or LiftingCast
+// rejects it. Each connection gets its own ping and timeout goroutines, which
+// stop when that connection ends.
 type Client struct {
 	// Connection configuration
 	baseURL  string
@@ -115,7 +137,8 @@ func (c *Client) Start() {
 }
 
 // run dials, serves each connection until it ends, and waits out the backoff
-// before dialling again, until Close.
+// before dialling again, until Close. Once rejected it stops dialling and
+// waits for Close.
 func (c *Client) run() {
 	defer close(c.messages)
 	c.backoff = c.initialBackoff
@@ -126,18 +149,28 @@ func (c *Client) run() {
 		}
 		if err != nil {
 			log.Printf("Failed to connect to LiftingCast: %v", err)
-			c.setStatus(ClientStatus{LastError: err.Error()})
 		} else {
-			c.backoff = c.initialBackoff
 			c.setStatus(ClientStatus{Connected: true})
-			err := c.serve(conn)
+			var resetBackoff bool
+			resetBackoff, err = c.serve(conn)
 			if err == nil {
-				c.setStatus(ClientStatus{})
 				return
 			}
+			// Being accepted, or getting the meet state every new connection
+			// gets, isn't enough to reset the backoff: two clients taking the
+			// one connection Hosted LiftingCast allows from each other would
+			// never slow down.
+			if resetBackoff {
+				c.backoff = c.initialBackoff
+			}
 			log.Printf("LiftingCast connection dropped: %v", err)
-			c.setStatus(ClientStatus{LastError: err.Error()})
 		}
+		if isRejected(err) {
+			c.setStatus(ClientStatus{Rejected: true, LastError: err.Error()})
+			<-c.stop
+			return
+		}
+		c.setStatus(ClientStatus{LastError: err.Error()})
 
 		log.Printf("Attempting to reconnect in %v", c.backoff)
 		select {
@@ -199,10 +232,13 @@ func (c *Client) dial() (*websocket.Conn, error) {
 			return conn, nil
 		},
 	}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		if c.stopped() {
 			return nil, errClientClosed
+		}
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			return nil, rejectedError{fmt.Errorf("handshake refused: %s", resp.Status)}
 		}
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
@@ -240,8 +276,12 @@ func (c *Client) buildURL() (string, error) {
 
 // serve reads from conn until it fails, alongside conn's ping and timeout
 // goroutines, which have stopped by the time it returns. It returns why the
-// connection ended, or nil if the client was closed.
-func (c *Client) serve(conn *websocket.Conn) error {
+// connection ended, or nil if the client was closed: the last server error if
+// there was one, since LiftingCast drops the connection right after sending
+// it. A server error known to be permanent ends the connection at once. It
+// also reports whether the backoff should reset: the connection delivered
+// meet state and did not end with a server error.
+func (c *Client) serve(conn *websocket.Conn) (resetBackoff bool, err error) {
 	done := make(chan struct{})
 	heartbeat := make(chan struct{}, 1)
 	var wg sync.WaitGroup
@@ -256,6 +296,8 @@ func (c *Client) serve(conn *websocket.Conn) error {
 		timedOut = c.timeoutMonitor(conn, done, heartbeat)
 	}()
 
+	var gotMeetState bool
+	var serverErr error
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
@@ -263,21 +305,38 @@ func (c *Client) serve(conn *websocket.Conn) error {
 			close(done)
 			wg.Wait()
 
-			if c.stopped() {
-				return nil
+			resetBackoff := gotMeetState && serverErr == nil
+			switch {
+			case c.stopped():
+				return resetBackoff, nil
+			case serverErr != nil:
+				return resetBackoff, serverErr
+			case timedOut:
+				return resetBackoff, errors.New("connection timeout")
 			}
-			if timedOut {
-				return errors.New("connection timeout")
-			}
-			return err
+			return resetBackoff, err
 		}
 
-		c.handleMessage(message, heartbeat)
+		meetState, err := c.handleMessage(message, heartbeat)
+		if meetState {
+			// The connection survived the server error, so it isn't why the
+			// connection ends
+			gotMeetState = true
+			serverErr = nil
+		}
+		if err != nil {
+			serverErr = err
+			if isRejected(err) {
+				conn.Close()
+			}
+		}
 	}
 }
 
-// handleMessage processes received messages
-func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
+// handleMessage processes received messages. It reports whether message was
+// meet state, or returns the server error if it was one, as a rejectedError
+// if it is known to be permanent.
+func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) (meetState bool, err error) {
 	msgStr := string(message)
 
 	// Check for pong response
@@ -286,32 +345,37 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
 		log.Println("Received pong from LiftingCast")
 		// Signal heartbeat for timeout monitoring
 		signal(heartbeat)
-		return
+		return false, nil
 	}
 
 	// Check the message is meet-state JSON, but pass on the raw bytes so the
 	// cache can tell which fields it left out
 	var meetData *MeetApiResponse
-	err := json.Unmarshal(message, &meetData)
+	err = json.Unmarshal(message, &meetData)
 	if err == nil && meetData == nil {
 		err = errors.New("message is null")
 	}
 	if err != nil {
 		// Not meet-state JSON - treat as error message
 		log.Printf("error unmarshalling Liftingcast message: %s", err)
-		c.setLastError(fmt.Sprintf("server error: %s", msgStr))
-		return
+		err = fmt.Errorf("server error: %s", msgStr)
+		if permanentServerErrors[msgStr] {
+			err = rejectedError{err}
+		}
+		c.setLastError(err.Error())
+		return false, err
 	}
 
 	// Valid meet state
 	select {
 	case c.messages <- json.RawMessage(message):
 	case <-c.stop:
-		return
+		return false, nil
 	}
 
 	// Signal heartbeat for timeout monitoring (non-blocking)
 	signal(heartbeat)
+	return true, nil
 }
 
 // pingPump sends periodic ping messages on one connection
@@ -360,17 +424,24 @@ func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, hear
 	}
 }
 
+// setStatus records status, unless the client has been closed: Close clears
+// the status, and nothing seen afterwards may overwrite that.
 func (c *Client) setStatus(status ClientStatus) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
-	c.status = status
+	if !c.stopped() {
+		c.status = status
+	}
 }
 
-// setLastError records err without changing whether the client is connected.
+// setLastError records err without changing whether the client is connected,
+// unless the client has been closed.
 func (c *Client) setLastError(err string) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
-	c.status.LastError = err
+	if !c.stopped() {
+		c.status.LastError = err
+	}
 }
 
 func (c *Client) stopped() bool {
@@ -406,7 +477,9 @@ func (c *Client) Close() {
 		return
 	}
 	close(c.stop)
-	c.setStatus(ClientStatus{})
+	c.statusMu.Lock()
+	c.status = ClientStatus{}
+	c.statusMu.Unlock()
 	if c.conn != nil {
 		c.conn.Close()
 	}
