@@ -152,6 +152,37 @@ func expectOnly(t *testing.T, rec, control *lotRecorder, lot int, lots []int) {
 	}
 }
 
+// inBackground calls f in a new goroutine and returns a channel closed once
+// it returns.
+func inBackground(f func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f()
+	}()
+	return done
+}
+
+// expectBlocked fails with msg if done closes within a short while.
+func expectBlocked(t *testing.T, done <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal(msg)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// expectDone fails with msg unless done closes within a second.
+func expectDone(t *testing.T, done <-chan struct{}, msg string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal(msg)
+	}
+}
+
 func TestHubDeliversStatesToListenerInOrder(t *testing.T) {
 	hub, send := startHub(t)
 	rec := newLotRecorder()
@@ -233,10 +264,12 @@ func TestHubStopsDeliveringToStoppedListener(t *testing.T) {
 	rec.waitFor(t, 0)
 	control.waitFor(t, 9)
 
-	// The call already in progress finishes, but none of the queued states
-	// is handed over after stop returns.
-	stop()
+	// stop waits for the call already in progress, and none of the queued
+	// states is handed over after it returns.
+	stopped := inBackground(stop)
+	expectBlocked(t, stopped, "stop returned while the handler was still running")
 	close(release)
+	expectDone(t, stopped, "stop did not return once the handler finished")
 	send(10)
 	expectOnly(t, rec, control, 10, []int{0})
 }
@@ -349,10 +382,12 @@ func TestHubCloseStopsEveryListener(t *testing.T) {
 	busy.waitFor(t, 0)
 	idle.waitFor(t, 9)
 
-	// The call already in progress finishes, but none of the queued states
-	// is handed over after Close returns.
-	hub.Close()
+	// Close waits for the call already in progress, and none of the queued
+	// states is handed over after it returns.
+	closed := inBackground(hub.Close)
+	expectBlocked(t, closed, "Close returned while a handler was still running")
 	close(release)
+	expectDone(t, closed, "Close did not return once the handler finished")
 	time.Sleep(20 * time.Millisecond)
 	if got := busy.recorded(); !reflect.DeepEqual(got, []int{0}) {
 		t.Errorf("listener saw lots %v after Close, want only 0", got)
@@ -392,6 +427,72 @@ func TestHubCloseFromInsideHandler(t *testing.T) {
 	}
 	if status := hub.GetStatus(); status != (ConnectionStatus{}) {
 		t.Errorf("status = %+v after Close, want the zero status", status)
+	}
+}
+
+// Handlers that stop each other's listeners at the same time must not each
+// wait for the other to finish.
+func TestHubHandlersStoppingEachOtherDontDeadlock(t *testing.T) {
+	hub, send := startHub(t)
+	var stopA, stopB func()
+	ready := make(chan struct{})
+	bothIn := sync.WaitGroup{}
+	bothIn.Add(2)
+	returned := make(chan struct{}, 2)
+	crossStop := func(other *func()) func(*MeetApiResponse) {
+		var once sync.Once
+		return func(*MeetApiResponse) {
+			once.Do(func() {
+				<-ready
+				bothIn.Done()
+				bothIn.Wait()
+				(*other)()
+				returned <- struct{}{}
+			})
+		}
+	}
+	stopA = hub.Listen(crossStop(&stopB))
+	stopB = hub.Listen(crossStop(&stopA))
+	close(ready)
+
+	send(0)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("handlers stopping each other deadlocked")
+		}
+	}
+}
+
+// Two handlers closing the Hub at the same time must not each wait for the
+// other to finish.
+func TestHubHandlersClosingTogetherDontDeadlock(t *testing.T) {
+	hub, send := startHub(t)
+	var bothIn sync.WaitGroup
+	bothIn.Add(2)
+	returned := make(chan struct{}, 2)
+	closeOnce := func() func(*MeetApiResponse) {
+		var once sync.Once
+		return func(*MeetApiResponse) {
+			once.Do(func() {
+				bothIn.Done()
+				bothIn.Wait()
+				hub.Close()
+				returned <- struct{}{}
+			})
+		}
+	}
+	hub.Listen(closeOnce())
+	hub.Listen(closeOnce())
+
+	send(0)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-returned:
+		case <-time.After(time.Second):
+			t.Fatal("handlers closing the hub together deadlocked")
+		}
 	}
 }
 

@@ -52,10 +52,12 @@ type Hub struct {
 	reconnect chan *ReconnectRequest
 
 	// closing is closed by the first Close, which then waits for the loop to
-	// shut down and close closed
+	// shut down and close closed. The loop leaves the listeners it stopped
+	// in final, for Close to wait for.
 	closeOnce sync.Once
 	closing   chan struct{}
 	closed    chan struct{}
+	final     []*listener
 }
 
 // listenRequest asks the loop to add a listener, and is answered on
@@ -133,11 +135,13 @@ func (h *Hub) run() {
 // Each listener has its own unbounded queue and goroutine: handler is called
 // with one state at a time, and a slow handler delays only its own listener.
 //
-// stop may be called any number of times, from any goroutine, including from
-// inside handler. Once it returns, no further call to handler starts; a call
-// already in progress runs to completion, and stop does not wait for it.
-// After Close, Listen never calls handler and returns a stop that does
-// nothing.
+// stop may be called any number of times, from any goroutine. Once it
+// returns, handler is not running and will not be called again, so whatever
+// handler uses can be torn down. Called from inside any listener's handler,
+// stop only makes sure no further call starts and does not wait for one in
+// progress, since a handler waiting for itself, or two handlers waiting for
+// each other, would never return. After Close, Listen never calls handler
+// and returns a stop that does nothing.
 func (h *Hub) Listen(handler func(*MeetApiResponse)) (stop func()) {
 	l := newListener(handler)
 	req := listenRequest{listener: l, registered: make(chan struct{})}
@@ -183,18 +187,22 @@ func (h *Hub) requestReconnect(req *ReconnectRequest) {
 }
 
 // Close closes the upstream connection and stops every listener, with the
-// same guarantee as each listener's stop: once Close returns, no further
-// handler call starts, and a call already in progress runs to completion.
-// It never waits for a handler, so it is safe to call from inside one. Close
-// may be called any number of times. Afterwards the hub stays closed: see
-// Listen, Reconnect, Disconnect and GetStatus.
+// same guarantee as each listener's stop: once Close returns, no handler is
+// running or will be called again. Called from inside a handler, it only
+// makes sure no further handler call starts, as stop does. Close may be
+// called any number of times. Afterwards the hub stays closed: see Listen,
+// Reconnect, Disconnect and GetStatus.
 func (h *Hub) Close() {
 	h.closeOnce.Do(func() { close(h.closing) })
 	<-h.closed
+	for _, l := range h.final {
+		l.wait()
+	}
 }
 
-// shutdown closes the upstream connection, forgets the meet and stops every
-// listener, as the loop's last act
+// shutdown closes the upstream connection, forgets the meet and signals
+// every listener to stop, as the loop's last act. It leaves waiting for
+// their handlers to Close, so the loop never blocks on a handler.
 func (h *Hub) shutdown() {
 	if h.upstreamClient != nil {
 		h.upstreamClient.Close()
@@ -207,7 +215,8 @@ func (h *Hub) shutdown() {
 
 	h.mu.Lock()
 	for l := range h.listeners {
-		l.stop()
+		l.signalStop()
+		h.final = append(h.final, l)
 	}
 	h.listeners = nil
 	h.mu.Unlock()
