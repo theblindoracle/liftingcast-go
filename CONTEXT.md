@@ -13,15 +13,27 @@ One top-level part of the meet state: the meet name, units or federation, lifter
 _Avoid_: key, part
 
 **Upstream connection**:
-The single live link to LiftingCast for one meet and one set of credentials. It keeps trying to connect until it is deliberately closed. Switching meets or credentials means replacing it, not changing it.
+The single live link to LiftingCast for one meet and one set of credentials. It keeps trying to connect until it is deliberately closed or rejected. Switching meets or credentials means replacing it, not changing it.
 _Avoid_: socket, session
 
 **Connection status**:
-Whether the upstream connection is connected right now, and the most recent error it saw. Connected means LiftingCast accepted the connection, not that the credentials are known to be good. It describes the connection itself, not how far consumers have got through the meet states already sent to them.
+Whether the upstream connection is connected right now, whether it has been rejected, and the most recent error it saw. A server error stays the most recent error through the disconnect that follows it. Connected means LiftingCast accepted the connection, not that the credentials are known to be good. It describes the connection itself, not how far consumers have got through the meet states already sent to them.
 _Avoid_: health, online
 
 **Server error**:
-A message LiftingCast sends on a healthy upstream connection that is not meet state. It sets the last error but leaves the connection connected.
+A message LiftingCast sends on an upstream connection that is not meet state. Most are temporary: they set the last error, and the connection stays connected or reconnects as usual. A few are known to be permanent, and those reject the connection.
+
+**Rejected**:
+LiftingCast has refused this upstream connection's meet or credentials for good, signalled by a server error known to be permanent or by a refused handshake (unauthorized or forbidden). A rejected connection is closed and does not reconnect; it stays rejected until it is replaced. A server error that isn't known to be permanent never rejects.
+_Avoid_: stopped, gave up, failed
+
+**Hosted LiftingCast**:
+LiftingCast at liftingcast.com. It allows only one upstream connection at a time per API key, even across different meets, so a second connection with the same API key pushes the first one off.
+_Avoid_: production, cloud
+
+**Self-hosted LiftingCast**:
+LiftingCast run from its Docker image. It allows any number of upstream connections at once.
+_Avoid_: local, Docker
 
 **Listener**:
 An in-process consumer that receives every meet state in order. It outlives any one upstream connection and stops only when unregistered or replaced by another listener with the same ID.
