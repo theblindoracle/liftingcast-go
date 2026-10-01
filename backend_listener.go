@@ -3,6 +3,11 @@ package liftingcast
 import "sync"
 
 // BackendListenerHandler is a function that processes meet data updates
+//
+// Every listener is handed the same state, concurrently, so a handler must
+// treat it as read-only. The Hub never modifies a state once it has handed
+// it out, so a handler may keep it, for example to compare with the next.
+// A handler that needs to modify the state must copy it first.
 type BackendListenerHandler func(*MeetApiResponse)
 
 // BackendListener represents an in-process listener that receives meet data updates
