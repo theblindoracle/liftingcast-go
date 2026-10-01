@@ -254,3 +254,66 @@ func TestHubIgnoresReregisteredUnregisteredListener(t *testing.T) {
 	send(0)
 	rec.waitFor(t, 0)
 }
+
+// A listener registering while states are still on their way to Run must
+// not be handed a cached state newer than the states queued behind it.
+func TestHubLateListenerNeverSeesStatesGoBackwards(t *testing.T) {
+	// Run picks between a pending registration and queued states at
+	// random, so try several times.
+	for round := 0; round < 10; round++ {
+		srv := newFakeServer(t)
+		hub := NewHub(srv.url, "meet", "password", "key")
+		t.Cleanup(hub.Disconnect)
+		conn := srv.accept(t, time.Second)
+
+		// Before Run starts, the states pile up on their way to it.
+		for lot := 0; lot <= 5; lot++ {
+			raw := fmt.Sprintf(`{"name": "Test Meet", "lifters": {"l1": {"id": "l1", "lot": %d}}}`, lot)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(raw)); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+
+		rec := newLotRecorder()
+		go func() { hub.RegisterBackendListener() <- NewBackendListener("late", rec.handle) }()
+		time.Sleep(10 * time.Millisecond)
+		go hub.Run()
+		rec.waitFor(t, 5)
+
+		got := rec.recorded()
+		if want := lotsUpTo(got[0], 5); !reflect.DeepEqual(got, want) {
+			t.Fatalf("round %d: listener saw lots %v, want %d..5 in order", round, got, got[0])
+		}
+	}
+}
+
+func TestHubReportsDisconnectedAfterDropEvenWithStatesQueued(t *testing.T) {
+	srv := newFakeServer(t)
+	hub := NewHub(srv.url, "meet", "password", "key")
+	t.Cleanup(hub.Disconnect)
+	conn := srv.accept(t, time.Second)
+
+	// States arrive and the connection drops before Run handles them.
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"name": "Test Meet", "lifters": {"l1": {"id": "l1", "lot": 0}}}`)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	conn.Close()
+	deadline := time.Now().Add(time.Second)
+	for hub.GetStatus().Connected {
+		if time.Now().After(deadline) {
+			t.Fatal("hub never noticed the dropped connection")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	rec := newLotRecorder()
+	go hub.Run()
+	hub.RegisterBackendListener() <- NewBackendListener("test", rec.handle)
+	rec.waitFor(t, 0)
+
+	if status := hub.GetStatus(); status.Connected {
+		t.Errorf("status = %+v after the drop, want disconnected until the client reconnects", status)
+	}
+}

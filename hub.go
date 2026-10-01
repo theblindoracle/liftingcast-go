@@ -27,10 +27,10 @@ type ConnectionStatus struct {
 type Hub struct {
 	mu sync.RWMutex
 
-	// broadcast carries raw messages from the upstream connection to Run,
+	// upstream carries raw messages from the upstream connection to Run,
 	// which merges them, so the cache never runs ahead of what listeners
 	// have been sent
-	broadcast chan upstreamMessage
+	upstream chan upstreamMessage
 
 	// Backend listeners (in-process subscribers)
 	backendListeners  map[string]*BackendListener
@@ -77,7 +77,7 @@ func NewHub(baseURL, meetID, password, apiKey string) *Hub {
 // NewIdleHub creates a hub without an upstream connection (idle mode)
 func NewIdleHub() *Hub {
 	return &Hub{
-		broadcast:         make(chan upstreamMessage, 10),
+		upstream:          make(chan upstreamMessage, 10),
 		backendListeners:  make(map[string]*BackendListener),
 		registerBackend:   make(chan *BackendListener),
 		unregisterBackend: make(chan *BackendListener),
@@ -95,7 +95,7 @@ func (h *Hub) Run() {
 			h.registerBackendListener(listener)
 		case listener := <-h.unregisterBackend:
 			h.unregisterBackendListener(listener)
-		case msg := <-h.broadcast:
+		case msg := <-h.upstream:
 			h.handleUpstreamMessage(msg)
 		case req := <-h.reconnect:
 			h.handleReconnect(req)
@@ -222,8 +222,14 @@ func (h *Hub) maintainUpstreamConnection(client *Client, done <-chan struct{}) {
 			log.Println("Upstream connection stopped")
 			return
 		case raw := <-client.DataUpdate():
+			// Set here, in order with the error case below, not when Run
+			// gets to the message
+			h.statusMu.Lock()
+			h.connected = true
+			h.statusMu.Unlock()
+
 			select {
-			case h.broadcast <- upstreamMessage{client: client, raw: raw}:
+			case h.upstream <- upstreamMessage{client: client, raw: raw}:
 			case <-done:
 				return
 			}
@@ -260,10 +266,6 @@ func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
 		log.Printf("Failed to merge data: %v", err)
 		return
 	}
-
-	h.statusMu.Lock()
-	h.connected = true
-	h.statusMu.Unlock()
 
 	h.broadcastToBackendListeners(merged)
 }
