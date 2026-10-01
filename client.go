@@ -1,11 +1,13 @@
 package liftingcast
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
 	"sync"
 	"time"
@@ -22,6 +24,12 @@ const (
 
 	// Initial backoff for reconnection
 	initialBackoff = 2 * time.Second
+
+	// Longest wait between reconnect attempts
+	maxBackoff = 30 * time.Second
+
+	// Longest a dial may take, from TCP connect to WebSocket handshake
+	handshakeTimeout = 10 * time.Second
 
 	// Write deadline for sending messages
 	writeWait = 10 * time.Second
@@ -53,9 +61,11 @@ type Client struct {
 	stopOnce   sync.Once
 
 	// Timings, defaulted from the package constants and shortened in tests
-	pingInterval   time.Duration
-	messageTimeout time.Duration
-	initialBackoff time.Duration
+	pingInterval     time.Duration
+	messageTimeout   time.Duration
+	initialBackoff   time.Duration
+	maxBackoff       time.Duration
+	handshakeTimeout time.Duration
 
 	// Reconnection state. Only one goroutine reconnects at a time: the
 	// readPump of the connection that ended, before it starts the next one.
@@ -65,17 +75,19 @@ type Client struct {
 // NewClient creates a new LiftingCast WebSocket client
 func NewClient(baseURL, meetID, password, apiKey string) *Client {
 	return &Client{
-		baseURL:        baseURL,
-		meetID:         meetID,
-		password:       password,
-		apiKey:         apiKey,
-		dataUpdate:     make(chan json.RawMessage, 10),
-		errorChan:      make(chan error, 10),
-		stop:           make(chan struct{}),
-		pingInterval:   pingInterval,
-		messageTimeout: messageTimeout,
-		initialBackoff: initialBackoff,
-		backoff:        initialBackoff,
+		baseURL:          baseURL,
+		meetID:           meetID,
+		password:         password,
+		apiKey:           apiKey,
+		dataUpdate:       make(chan json.RawMessage, 10),
+		errorChan:        make(chan error, 10),
+		stop:             make(chan struct{}),
+		pingInterval:     pingInterval,
+		messageTimeout:   messageTimeout,
+		initialBackoff:   initialBackoff,
+		maxBackoff:       maxBackoff,
+		handshakeTimeout: handshakeTimeout,
+		backoff:          initialBackoff,
 	}
 }
 
@@ -89,7 +101,8 @@ func (c *Client) Connect() error {
 	return nil
 }
 
-// dial opens a new connection and makes it the current one.
+// dial makes one attempt to open a new connection and make it the current
+// one. Close abandons a pending dial.
 func (c *Client) dial() (*websocket.Conn, error) {
 	// Build WebSocket URL with query parameters
 	wsURL, err := c.buildURL()
@@ -99,11 +112,47 @@ func (c *Client) dial() (*websocket.Conn, error) {
 
 	log.Printf("Connecting to LiftingCast API for meet %s", c.meetID)
 
-	// Establish WebSocket connection
-	conn, err := c.dialWithRetry(wsURL, 5, time.Second*2)
+	// gorilla/websocket stops watching ctx once the TCP connection is up, so
+	// Close interrupts the handshake by closing that connection itself.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var netMu sync.Mutex
+	var netConn net.Conn
+	go func() {
+		select {
+		case <-c.stop:
+			cancel()
+			netMu.Lock()
+			if netConn != nil {
+				netConn.Close()
+			}
+			netMu.Unlock()
+		case <-ctx.Done():
+		}
+	}()
+
+	dialer := &websocket.Dialer{
+		ReadBufferSize:   131072, // 128KB buffer
+		WriteBufferSize:  131072, // 128KB buffer
+		HandshakeTimeout: c.handshakeTimeout,
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err == nil {
+				netMu.Lock()
+				netConn = conn
+				netMu.Unlock()
+			}
+			return conn, err
+		},
+	}
+	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
+		if c.stopped() {
+			return nil, ErrClientClosed
+		}
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
+	log.Println("Liftingcast connection established successfully")
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -125,39 +174,6 @@ func (c *Client) start(conn *websocket.Conn) {
 	go c.readPump(conn, done, heartbeat)
 	go c.pingPump(conn, done)
 	go c.timeoutMonitor(conn, done, heartbeat)
-}
-
-func (c *Client) dialWithRetry(url string, maxRetries int, initialDelay time.Duration) (*websocket.Conn, error) {
-	var conn *websocket.Conn
-	var err error
-	delay := initialDelay
-	dialer := &websocket.Dialer{
-		ReadBufferSize:  131072, // 128KB buffer
-		WriteBufferSize: 131072, // 128KB buffer
-	}
-
-	for i := 0; i < maxRetries; i++ {
-		if i > 0 {
-			log.Printf("Retrying connection attempt %d/%d after %v delay...\n", i+1, maxRetries, delay)
-			select {
-			case <-time.After(delay):
-			case <-c.stop:
-				return nil, ErrClientClosed
-			}
-			delay *= 2 // Exponential backoff
-		}
-
-		conn, _, err = dialer.Dial(url, nil)
-		if err == nil {
-			log.Println("Liftingcast connection established successfully")
-			return conn, nil
-		}
-
-		// Handle specific errors if needed
-		log.Printf("Dial error: %v\n", err)
-	}
-
-	return nil, fmt.Errorf("after %d attempts, last error: %s", maxRetries, err)
 }
 
 // buildURL constructs the WebSocket URL with query parameters
@@ -294,8 +310,8 @@ func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, hear
 	}
 }
 
-// reconnect retries Connect with exponential backoff until it succeeds or
-// the client is closed.
+// reconnect retries Connect with exponential backoff, capped at maxBackoff,
+// until it succeeds or the client is closed.
 func (c *Client) reconnect() {
 	for {
 		log.Printf("Attempting to reconnect in %v", c.backoff)
@@ -308,7 +324,7 @@ func (c *Client) reconnect() {
 		}
 
 		// Double the backoff for next attempt
-		c.backoff = c.backoff * 2
+		c.backoff = min(c.backoff*2, c.maxBackoff)
 
 		conn, err := c.dial()
 		if err != nil {
