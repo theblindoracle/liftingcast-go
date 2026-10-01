@@ -94,6 +94,9 @@ func TestCacheMergeWithoutMeetFieldsKeepsThem(t *testing.T) {
 	if merged.Federation != "USAPL" {
 		t.Errorf("federation = %q, want USAPL", merged.Federation)
 	}
+	if alice := (*merged.Lifters)["l1"]; alice.Name == nil || *alice.Name != "Alice" {
+		t.Errorf("lifter l1 = %v, want Alice kept though the update left her out", alice)
+	}
 }
 
 func TestCacheMergeReturnsCopy(t *testing.T) {

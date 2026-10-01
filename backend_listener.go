@@ -69,12 +69,6 @@ func (l *BackendListener) deliver() {
 		}
 
 		for {
-			select {
-			case <-l.Done:
-				return
-			default:
-			}
-
 			l.mu.Lock()
 			if len(l.pending) == 0 {
 				l.mu.Unlock()
@@ -85,6 +79,11 @@ func (l *BackendListener) deliver() {
 			l.pending = l.pending[1:]
 			l.mu.Unlock()
 
+			select {
+			case <-l.Done:
+				return
+			default:
+			}
 			l.Handler(state)
 		}
 	}

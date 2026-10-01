@@ -207,3 +207,16 @@ func TestHubStopsDeliveringToUnregisteredListener(t *testing.T) {
 		t.Errorf("unregistered listener saw lots %v, want only 0", got)
 	}
 }
+
+func TestHubUnregisteringReplacedListenerKeepsItsReplacement(t *testing.T) {
+	hub, send := startHub(t)
+	old := NewBackendListener("same", func(*MeetApiResponse) {})
+	hub.RegisterBackendListener() <- old
+	rec := newLotRecorder()
+	replacement := NewBackendListener("same", rec.handle)
+	hub.RegisterBackendListener() <- replacement
+
+	hub.UnregisterBackendListener() <- old
+	send(0)
+	rec.waitFor(t, 0)
+}

@@ -238,9 +238,13 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
 
 	// Check the message is meet-state JSON, but pass on the raw bytes so the
 	// cache can tell which fields it left out
-	var meetData MeetApiResponse
-	if err := json.Unmarshal(message, &meetData); err != nil {
-		// Not valid JSON - treat as error message
+	var meetData *MeetApiResponse
+	err := json.Unmarshal(message, &meetData)
+	if err == nil && meetData == nil {
+		err = errors.New("message is null")
+	}
+	if err != nil {
+		// Not meet-state JSON - treat as error message
 		log.Printf("error unmarshalling Liftingcast message: %s", err)
 		c.reportError(fmt.Errorf("server error: %s", msgStr))
 		return

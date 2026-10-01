@@ -259,7 +259,8 @@ func (h *Hub) broadcastToBackendListeners(data *MeetApiResponse) {
 }
 
 // registerBackendListener registers a new backend listener and starts
-// delivering to it, beginning with the cached state if there is one
+// delivering to it, beginning with the cached state if there is one. A
+// listener it replaces under the same ID is closed.
 func (h *Hub) registerBackendListener(listener *BackendListener) {
 	h.mu.Lock()
 	previous, replaced := h.backendListeners[listener.ID]
@@ -284,10 +285,11 @@ func (h *Hub) registerBackendListener(listener *BackendListener) {
 	log.Printf("Backend listener registered: %s (total listeners: %d)", listener.ID, count)
 }
 
-// unregisterBackendListener removes a backend listener
+// unregisterBackendListener removes a backend listener, unless it has
+// already been replaced by another listener with the same ID
 func (h *Hub) unregisterBackendListener(listener *BackendListener) {
 	h.mu.Lock()
-	if _, exists := h.backendListeners[listener.ID]; exists {
+	if h.backendListeners[listener.ID] == listener {
 		delete(h.backendListeners, listener.ID)
 		listener.Close()
 		count := len(h.backendListeners)

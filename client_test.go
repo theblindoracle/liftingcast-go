@@ -289,3 +289,26 @@ func TestClientCloseDuringDialEndsReconnection(t *testing.T) {
 		t.Fatal("Close did not end a pending dial")
 	}
 }
+
+func TestClientReportsNonObjectMessagesAsErrors(t *testing.T) {
+	srv := newFakeServer(t)
+	c := NewClient(srv.url, "meet", "password", "key")
+	t.Cleanup(c.Close)
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	conn := srv.accept(t, time.Second)
+
+	for _, raw := range []string{`null`, `[1]`, `not json`} {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(raw)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		select {
+		case <-c.Errors():
+		case m := <-c.DataUpdate():
+			t.Fatalf("DataUpdate got %s, want it reported on Errors", m)
+		case <-time.After(time.Second):
+			t.Fatalf("message %s was neither reported nor passed on", raw)
+		}
+	}
+}
