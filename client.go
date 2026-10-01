@@ -137,12 +137,18 @@ func (c *Client) dial() (*websocket.Conn, error) {
 		HandshakeTimeout: c.handshakeTimeout,
 		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
-			if err == nil {
-				netMu.Lock()
-				netConn = conn
-				netMu.Unlock()
+			if err != nil {
+				return nil, err
 			}
-			return conn, err
+			// Either the stop watcher sees netConn, or this sees the stop
+			netMu.Lock()
+			defer netMu.Unlock()
+			if c.stopped() {
+				conn.Close()
+				return nil, ErrClientClosed
+			}
+			netConn = conn
+			return conn, nil
 		},
 	}
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
