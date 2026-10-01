@@ -152,8 +152,8 @@ type PlatformData struct {
 	RefLights           RefLights       `json:"refLights"`
 }
 
-// Platform maps platform IDs to platform data
-type Platform map[string]PlatformData
+// Platforms maps platform IDs to platform data
+type Platforms map[string]PlatformData
 
 // WeightClassData represents a weight class
 type WeightClassData struct {
@@ -161,15 +161,15 @@ type WeightClassData struct {
 	MaxWeight NullableFloat64 `json:"maxWeight"`
 }
 
-// WeightClass maps weight class IDs to weight class data
-type WeightClass map[string]WeightClassData
+// WeightClasses maps weight class IDs to weight class data
+type WeightClasses map[string]WeightClassData
 
 // DivisionData represents a division
 type DivisionData struct {
-	ID            string      `json:"id"`
-	Name          *string     `json:"name"`
-	ScoreBy       *string     `json:"scoreBy"`
-	WeightClasses WeightClass `json:"weightClasses"`
+	ID            string        `json:"id"`
+	Name          *string       `json:"name"`
+	ScoreBy       *string       `json:"scoreBy"`
+	WeightClasses WeightClasses `json:"weightClasses"`
 }
 
 // Divisions maps division IDs to division data
@@ -184,13 +184,13 @@ type TeamData struct {
 // Teams maps team names to team standings
 type Teams map[string]TeamData
 
-// MeetApiResponse represents the complete meet state from LiftingCast API
-type MeetApiResponse struct {
+// MeetState represents the complete meet state from LiftingCast API
+type MeetState struct {
 	Name       string     `json:"name"`
 	Units      *string    `json:"units"` // "KG" | "LBS" | null
 	Federation string     `json:"federation"`
 	Lifters    *Lifters   `json:"lifters,omitempty"`
-	Platforms  *Platform  `json:"platforms,omitempty"`
+	Platforms  *Platforms `json:"platforms,omitempty"`
 	Divisions  *Divisions `json:"divisions,omitempty"`
 	Teams      *Teams     `json:"teams,omitempty"`
 }

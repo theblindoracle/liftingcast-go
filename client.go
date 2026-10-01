@@ -344,7 +344,7 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) (meetS
 
 	// Check the message is meet-state JSON, but pass on the raw bytes so the
 	// cache can tell which fields it left out
-	var meetData *MeetApiResponse
+	var meetData *MeetState
 	err = json.Unmarshal(message, &meetData)
 	if err == nil && meetData == nil {
 		err = errors.New("message is null")

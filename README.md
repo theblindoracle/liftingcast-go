@@ -7,7 +7,7 @@ Go client for the LiftingCast meet-state WebSocket API.
 - `Client` dials the WebSocket, sends heartbeats, detects silent connections and reconnects with backoff until closed or rejected.
 - `Cache` builds one meet state from LiftingCast's messages; each section a message carries replaces the cached copy.
 - `Hub` keeps an upstream connection alive, merges into a `Cache` and hands each merged state to in-process listeners added with `Listen`. `Connect` switches it to another meet or credentials; listeners stay put.
-- `MeetApiResponse` and friends are the meet-state types, with `NullableFloat64` for LiftingCast's loosely typed numbers.
+- `MeetState` and friends are the meet-state types, with `NullableFloat64` for LiftingCast's loosely typed numbers.
 
 ```go
 cfg := liftingcast.Config{
@@ -20,7 +20,7 @@ cfg := liftingcast.Config{
 hub := liftingcast.NewHub() // runs until Close
 defer hub.Close()
 hub.Connect(cfg)
-stop := hub.Listen(func(state *liftingcast.MeetApiResponse) {
+stop := hub.Listen(func(state *liftingcast.MeetState) {
 	// state is the full merged meet state, shared with every listener:
 	// read it or keep it, but copy it before modifying it
 })

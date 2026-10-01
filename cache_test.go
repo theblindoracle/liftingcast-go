@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func mustMerge(t *testing.T, cache *Cache, raw string) *MeetApiResponse {
+func mustMerge(t *testing.T, cache *Cache, raw string) *MeetState {
 	t.Helper()
 	merged, err := cache.Merge([]byte(raw))
 	if err != nil {
@@ -272,7 +272,7 @@ func TestCacheMergeDropsWeightClassDeletedUpstream(t *testing.T) {
 // replayRecording merges every message of a recording from testdata/ in
 // order. It returns the meet state after the last one, and that state as
 // LiftingCast last sent it: the latest copy of each section.
-func replayRecording(t *testing.T, name string) (merged, latest *MeetApiResponse) {
+func replayRecording(t *testing.T, name string) (merged, latest *MeetState) {
 	t.Helper()
 	f, err := os.Open(filepath.Join("testdata", name))
 	if err != nil {

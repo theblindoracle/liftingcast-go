@@ -5,13 +5,16 @@ import (
 	"sync"
 )
 
-// ConnectionStatus is the Client's ClientStatus plus the meet it is for
-type ConnectionStatus struct {
+// HubStatus is the connection status of a Hub's upstream connection (see
+// ClientStatus) plus the meet it is following. Its JSON form is meant to be
+// served as is, for example from a status endpoint. Without an upstream
+// connection it is the zero HubStatus.
+type HubStatus struct {
 	Connected bool   `json:"connected"`
 	Rejected  bool   `json:"rejected"`
 	MeetID    string `json:"meetId"`
 	MeetName  string `json:"meetName"`
-	Error     string `json:"error,omitempty"`
+	LastError string `json:"error,omitempty"`
 }
 
 // Hub keeps one upstream LiftingCast connection alive, merges its messages
@@ -37,7 +40,7 @@ type Hub struct {
 	cache *Cache
 
 	// Single persistent upstream LiftingCast connection and its meet. Only
-	// the loop changes them, under upstreamMu, so GetStatus can read them.
+	// the loop changes them, under upstreamMu, so Status can read them.
 	upstreamMu     sync.RWMutex
 	upstreamClient *Client
 	meetID         string
@@ -127,7 +130,7 @@ func (h *Hub) run() {
 // progress, since a handler waiting for itself, or two handlers waiting for
 // each other, would never return. After Close, Listen never calls handler
 // and returns a stop that does nothing.
-func (h *Hub) Listen(handler func(*MeetApiResponse)) (stop func()) {
+func (h *Hub) Listen(handler func(*MeetState)) (stop func()) {
 	l := newListener(handler)
 	req := listenRequest{listener: l, registered: make(chan struct{})}
 	select {
@@ -149,7 +152,7 @@ func (h *Hub) Listen(handler func(*MeetApiResponse)) (stop func()) {
 // Connect replaces the upstream connection, if there is one, with a new one
 // for the meet and credentials in cfg, and clears the meet state. Listeners
 // stay in place and receive the new meet's states. It returns once the new
-// connection has been started, so GetStatus reports the new meet. After Close
+// connection has been started, so Status reports the new meet. After Close
 // it does nothing.
 func (h *Hub) Connect(cfg Config) {
 	h.requestConnect(&cfg)
@@ -180,7 +183,7 @@ func (h *Hub) requestConnect(cfg *Config) {
 // running or will be called again. Called from inside a handler, it only
 // makes sure no further handler call starts, as stop does. Close may be
 // called any number of times. Afterwards the hub stays closed: see Listen,
-// Connect, Disconnect and GetStatus.
+// Connect, Disconnect and Status.
 func (h *Hub) Close() {
 	h.closeOnce.Do(func() { close(h.closing) })
 	<-h.closed
@@ -212,9 +215,9 @@ func (h *Hub) shutdown() {
 	h.opts.logger.Info("hub closed")
 }
 
-// GetStatus returns the current connection status. After Close it returns
-// the zero ConnectionStatus.
-func (h *Hub) GetStatus() ConnectionStatus {
+// Status returns the current connection status. After Close it returns
+// the zero HubStatus.
+func (h *Hub) Status() HubStatus {
 	h.upstreamMu.RLock()
 	client, meetID := h.upstreamClient, h.meetID
 	h.upstreamMu.RUnlock()
@@ -223,11 +226,11 @@ func (h *Hub) GetStatus() ConnectionStatus {
 	if client != nil {
 		clientStatus = client.Status()
 	}
-	status := ConnectionStatus{
+	status := HubStatus{
 		Connected: clientStatus.Connected,
 		Rejected:  clientStatus.Rejected,
 		MeetID:    meetID,
-		Error:     clientStatus.LastError,
+		LastError: clientStatus.LastError,
 	}
 
 	// Try to get meet name from cache
@@ -310,7 +313,7 @@ func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
 }
 
 // broadcast queues a merged state for every listener
-func (h *Hub) broadcast(state *MeetApiResponse) {
+func (h *Hub) broadcast(state *MeetState) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 

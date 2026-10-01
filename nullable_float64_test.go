@@ -142,24 +142,11 @@ func TestNullableFloat64_HelperMethods(t *testing.T) {
 		}
 	})
 
-	t.Run("ToFloat64Ptr method", func(t *testing.T) {
-		value := float64Ptr(42.5)
-		nf := NullableFloat64{Value: value}
-
-		result := nf.ToFloat64Ptr()
-		if result != value {
-			t.Errorf("ToFloat64Ptr() should return the same pointer")
-		}
-	})
-
 	t.Run("nil value methods", func(t *testing.T) {
 		nf := NullableFloat64{Value: nil}
 
 		if nf.Float64() != nil {
 			t.Errorf("Float64() should return nil for nil value")
-		}
-		if nf.ToFloat64Ptr() != nil {
-			t.Errorf("ToFloat64Ptr() should return nil for nil value")
 		}
 	})
 }

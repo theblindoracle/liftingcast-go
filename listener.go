@@ -14,21 +14,21 @@ import (
 // Only the Hub stops a listener, through stop, which is safe to call any
 // number of times.
 type listener struct {
-	handler func(*MeetApiResponse)
+	handler func(*MeetState)
 
 	// Queue of states not yet handed to handler, and whether the listener
 	// has stopped. wake is signalled whenever a state is added; done is
 	// closed when the listener stops; exited is closed when the delivery
 	// goroutine returns, after its last handler call.
 	mu      sync.Mutex
-	pending []*MeetApiResponse
+	pending []*MeetState
 	stopped bool
 	wake    chan struct{}
 	done    chan struct{}
 	exited  chan struct{}
 }
 
-func newListener(handler func(*MeetApiResponse)) *listener {
+func newListener(handler func(*MeetState)) *listener {
 	return &listener{
 		handler: handler,
 		wake:    make(chan struct{}, 1),
@@ -45,7 +45,7 @@ func (l *listener) start() {
 
 // enqueue adds a state to the listener's queue. It never blocks, and does
 // nothing once the listener has stopped.
-func (l *listener) enqueue(state *MeetApiResponse) {
+func (l *listener) enqueue(state *MeetState) {
 	l.mu.Lock()
 	if l.stopped {
 		l.mu.Unlock()
