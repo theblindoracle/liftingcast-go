@@ -261,13 +261,6 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) {
 	signal(heartbeat)
 }
 
-func signal(ch chan<- struct{}) {
-	select {
-	case ch <- struct{}{}:
-	default:
-	}
-}
-
 // pingPump sends periodic ping messages on one connection
 func (c *Client) pingPump(conn *websocket.Conn, done <-chan struct{}) {
 	ticker := time.NewTicker(c.pingInterval)
