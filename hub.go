@@ -24,36 +24,52 @@ type ConnectionStatus struct {
 }
 
 // Hub keeps one upstream LiftingCast connection alive, merges its messages
-// into a Cache, and hands each merged state to in-process BackendListeners.
+// into a Cache, and hands each merged state to in-process listeners added
+// with Listen. It runs its own loop from NewHub or NewIdleHub until Close.
 type Hub struct {
-	mu sync.RWMutex
-
-	// upstream carries raw messages from the upstream connection to Run,
-	// which merges them, so the cache never runs ahead of what listeners
-	// have been sent
+	// upstream carries raw messages from the upstream connection to the
+	// loop, which merges them, so the cache never runs ahead of what
+	// listeners have been sent
 	upstream chan upstreamMessage
 
-	// Backend listeners (in-process subscribers)
-	backendListeners  map[string]*BackendListener
-	registerBackend   chan *BackendListener
-	unregisterBackend chan *BackendListener
+	// Listeners, keyed by themselves. Only the loop adds them, so a new
+	// listener's first state is never older or newer than the next one the
+	// loop hands out; Listen's stop and the loop's shutdown remove them.
+	mu        sync.RWMutex
+	listeners map[*listener]struct{}
+	listen    chan listenRequest
 
 	// Shared cache for meet data
 	cache *Cache
 
 	// Single persistent upstream LiftingCast connection and its meet. Only
-	// Run changes them, under upstreamMu, so GetStatus can read them.
+	// the loop changes them, under upstreamMu, so GetStatus can read them.
 	upstreamMu     sync.RWMutex
 	upstreamClient *Client
 	meetID         string
 
 	// Reconnection channel
 	reconnect chan *ReconnectRequest
+
+	// closing is closed by the first Close, which then waits for the loop to
+	// shut down and close closed. The loop leaves the listeners it stopped
+	// in final, for Close to wait for.
+	closeOnce sync.Once
+	closing   chan struct{}
+	closed    chan struct{}
+	final     []*listener
+}
+
+// listenRequest asks the loop to add a listener, and is answered on
+// registered once it has
+type listenRequest struct {
+	listener   *listener
+	registered chan struct{}
 }
 
 // NewHub creates a new hub instance with an upstream connection
 func NewHub(baseURL, meetID, password, apiKey string) *Hub {
-	hub := NewIdleHub()
+	hub := newHub()
 	hub.meetID = meetID
 	hub.upstreamClient = hub.startClient(&ReconnectRequest{
 		BaseURL:  baseURL,
@@ -61,53 +77,154 @@ func NewHub(baseURL, meetID, password, apiKey string) *Hub {
 		Password: password,
 		APIKey:   apiKey,
 	})
+	go hub.run()
 	return hub
 }
 
 // NewIdleHub creates a hub without an upstream connection (idle mode)
 func NewIdleHub() *Hub {
+	hub := newHub()
+	go hub.run()
+	return hub
+}
+
+// newHub creates a hub whose loop has not started
+func newHub() *Hub {
 	return &Hub{
-		upstream:          make(chan upstreamMessage, 10),
-		backendListeners:  make(map[string]*BackendListener),
-		registerBackend:   make(chan *BackendListener),
-		unregisterBackend: make(chan *BackendListener),
-		cache:             NewCache(),
-		reconnect:         make(chan *ReconnectRequest),
+		upstream:  make(chan upstreamMessage, 10),
+		listeners: make(map[*listener]struct{}),
+		listen:    make(chan listenRequest),
+		cache:     NewCache(),
+		reconnect: make(chan *ReconnectRequest),
+		closing:   make(chan struct{}),
+		closed:    make(chan struct{}),
 	}
 }
 
-// Run starts the hub's main loop
-func (h *Hub) Run() {
+// run is the hub's loop. It alone merges upstream messages, adds listeners
+// and replaces the upstream connection, until Close.
+func (h *Hub) run() {
+	defer close(h.closed)
 	for {
 		select {
-		case listener := <-h.registerBackend:
-			h.registerBackendListener(listener)
-		case listener := <-h.unregisterBackend:
-			h.unregisterBackendListener(listener)
+		case req := <-h.listen:
+			h.addListener(req.listener)
+			close(req.registered)
 		case msg := <-h.upstream:
 			h.handleUpstreamMessage(msg)
 		case req := <-h.reconnect:
 			h.handleReconnect(req)
+		case <-h.closing:
+			h.shutdown()
+			return
 		}
 	}
 }
 
-// Reconnect triggers a reconnection with new credentials
+// Listen calls handler with every meet state from now on, in order, until the
+// returned stop is called or the Hub is closed. The first state is the
+// current meet state if there is one; after that no state is skipped,
+// repeated or older than the one before. Listen returns once the listener is
+// in place, so every state merged after it returns reaches handler.
+//
+// Every listener is handed the same state, concurrently, so handler must
+// treat it as read-only. The Hub never modifies a state once it has handed
+// it out, so handler may keep it, for example to compare with the next. A
+// handler that needs to modify the state must copy it first.
+//
+// Each listener has its own unbounded queue and goroutine: handler is called
+// with one state at a time, and a slow handler delays only its own listener.
+//
+// stop may be called any number of times, from any goroutine. Once it
+// returns, handler is not running and will not be called again, so whatever
+// handler uses can be torn down. Called from inside any listener's handler,
+// stop only makes sure no further call starts and does not wait for one in
+// progress, since a handler waiting for itself, or two handlers waiting for
+// each other, would never return. After Close, Listen never calls handler
+// and returns a stop that does nothing.
+func (h *Hub) Listen(handler func(*MeetApiResponse)) (stop func()) {
+	l := newListener(handler)
+	req := listenRequest{listener: l, registered: make(chan struct{})}
+	select {
+	case h.listen <- req:
+	case <-h.closing:
+		return func() {}
+	}
+	// The loop always answers a request it has taken
+	<-req.registered
+
+	return func() {
+		l.stop()
+		h.mu.Lock()
+		delete(h.listeners, l)
+		h.mu.Unlock()
+	}
+}
+
+// Reconnect triggers a reconnection with new credentials. After Close it
+// does nothing.
 func (h *Hub) Reconnect(baseURL, meetID, password, apiKey string) {
-	h.reconnect <- &ReconnectRequest{
+	h.requestReconnect(&ReconnectRequest{
 		BaseURL:  baseURL,
 		MeetID:   meetID,
 		Password: password,
 		APIKey:   apiKey,
+	})
+}
+
+// Disconnect stops the upstream connection and puts the hub in idle mode.
+// After Close it does nothing.
+func (h *Hub) Disconnect() {
+	h.requestReconnect(nil)
+}
+
+// requestReconnect hands req to the loop, unless the hub is closing
+func (h *Hub) requestReconnect(req *ReconnectRequest) {
+	select {
+	case h.reconnect <- req:
+	case <-h.closing:
 	}
 }
 
-// Disconnect stops the upstream connection and puts the hub in idle mode
-func (h *Hub) Disconnect() {
-	h.reconnect <- nil
+// Close closes the upstream connection and stops every listener, with the
+// same guarantee as each listener's stop: once Close returns, no handler is
+// running or will be called again. Called from inside a handler, it only
+// makes sure no further handler call starts, as stop does. Close may be
+// called any number of times. Afterwards the hub stays closed: see Listen,
+// Reconnect, Disconnect and GetStatus.
+func (h *Hub) Close() {
+	h.closeOnce.Do(func() { close(h.closing) })
+	<-h.closed
+	for _, l := range h.final {
+		l.wait()
+	}
 }
 
-// GetStatus returns the current connection status
+// shutdown closes the upstream connection, forgets the meet and signals
+// every listener to stop, as the loop's last act. It leaves waiting for
+// their handlers to Close, so the loop never blocks on a handler.
+func (h *Hub) shutdown() {
+	if h.upstreamClient != nil {
+		h.upstreamClient.Close()
+	}
+	h.upstreamMu.Lock()
+	h.upstreamClient = nil
+	h.meetID = ""
+	h.upstreamMu.Unlock()
+	h.cache.Clear()
+
+	h.mu.Lock()
+	for l := range h.listeners {
+		l.signalStop()
+		h.final = append(h.final, l)
+	}
+	h.listeners = nil
+	h.mu.Unlock()
+	log.Println("Hub closed")
+}
+
+// GetStatus returns the current connection status. After Close it returns
+// the zero ConnectionStatus.
 func (h *Hub) GetStatus() ConnectionStatus {
 	h.upstreamMu.RLock()
 	client, meetID := h.upstreamClient, h.meetID
@@ -167,13 +284,17 @@ func (h *Hub) handleReconnect(req *ReconnectRequest) {
 }
 
 // startClient starts a new upstream connection and forwards its messages to
-// Run until it is closed.
+// the loop until it is closed or the hub has closed.
 func (h *Hub) startClient(req *ReconnectRequest) *Client {
 	client := NewClient(req.BaseURL, req.MeetID, req.Password, req.APIKey)
 	client.Start()
 	go func() {
 		for raw := range client.Messages() {
-			h.upstream <- upstreamMessage{client: client, raw: raw}
+			select {
+			case h.upstream <- upstreamMessage{client: client, raw: raw}:
+			case <-h.closed:
+				return
+			}
 		}
 	}()
 	return client
@@ -200,74 +321,32 @@ func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
 		return
 	}
 
-	h.broadcastToBackendListeners(merged)
+	h.broadcast(merged)
 }
 
-// broadcastToBackendListeners queues meet data for all registered backend listeners
-func (h *Hub) broadcastToBackendListeners(data *MeetApiResponse) {
+// broadcast queues a merged state for every listener
+func (h *Hub) broadcast(state *MeetApiResponse) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	for _, listener := range h.backendListeners {
-		listener.enqueue(data)
+	for l := range h.listeners {
+		l.enqueue(state)
 	}
 }
 
-// registerBackendListener registers a new backend listener and starts
-// delivering to it, beginning with the cached state if there is one. A
-// listener it replaces under the same ID is closed.
-func (h *Hub) registerBackendListener(listener *BackendListener) {
-	select {
-	case <-listener.Done:
-		log.Printf("Ignoring registration of closed backend listener: %s", listener.ID)
-		return
-	default:
+// addListener starts delivering to a new listener, beginning with the cached
+// state if there is one. Only the loop calls it, so no merge can land
+// between reading the cache and the listener joining the next broadcast.
+func (h *Hub) addListener(l *listener) {
+	if cached := h.cache.Get(); cached != nil {
+		l.enqueue(cached)
 	}
+	l.start()
 
 	h.mu.Lock()
-	previous, replaced := h.backendListeners[listener.ID]
-	if replaced && previous == listener {
-		h.mu.Unlock()
-		return
-	}
-	if replaced {
-		previous.Close()
-	}
-	h.backendListeners[listener.ID] = listener
-	count := len(h.backendListeners)
-
-	// Queue the cached state before the listener can see any later broadcast
-	if cachedData := h.cache.Get(); cachedData != nil {
-		listener.enqueue(cachedData)
-		log.Printf("Queued cached data for backend listener: %s", listener.ID)
-	}
-	listener.start()
+	h.listeners[l] = struct{}{}
+	count := len(h.listeners)
 	h.mu.Unlock()
 
-	log.Printf("Backend listener registered: %s (total listeners: %d)", listener.ID, count)
-}
-
-// unregisterBackendListener removes a backend listener, unless it has
-// already been replaced by another listener with the same ID
-func (h *Hub) unregisterBackendListener(listener *BackendListener) {
-	h.mu.Lock()
-	if h.backendListeners[listener.ID] == listener {
-		delete(h.backendListeners, listener.ID)
-		listener.Close()
-		count := len(h.backendListeners)
-		h.mu.Unlock()
-		log.Printf("Backend listener unregistered: %s (remaining listeners: %d)", listener.ID, count)
-	} else {
-		h.mu.Unlock()
-	}
-}
-
-// RegisterBackendListener returns the backend listener registration channel
-func (h *Hub) RegisterBackendListener() chan<- *BackendListener {
-	return h.registerBackend
-}
-
-// UnregisterBackendListener returns the backend listener unregistration channel
-func (h *Hub) UnregisterBackendListener() chan<- *BackendListener {
-	return h.unregisterBackend
+	log.Printf("Listener added (total listeners: %d)", count)
 }

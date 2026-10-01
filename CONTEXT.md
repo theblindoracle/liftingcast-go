@@ -36,5 +36,5 @@ LiftingCast run from its Docker image. It allows any number of upstream connecti
 _Avoid_: local, Docker
 
 **Listener**:
-An in-process consumer that receives every meet state in order. It outlives any one upstream connection and stops only when unregistered or replaced by another listener with the same ID.
+An in-process consumer that receives every meet state in order, starting with the current meet state if there is one. It outlives any one upstream connection and stops only when its own stop is called or the Hub is closed; once stopped it is never called again.
 _Avoid_: subscriber, client
