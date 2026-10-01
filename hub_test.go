@@ -158,6 +158,25 @@ func TestHubSendsCachedStateBeforeLaterStates(t *testing.T) {
 	}
 }
 
+func TestHubSendsExactlyCachedStateThenLaterStates(t *testing.T) {
+	hub, send := startHub(t)
+	first := newLotRecorder()
+	hub.RegisterBackendListener() <- NewBackendListener("first", first.handle)
+	send(lotsUpTo(0, 49)...)
+	first.waitFor(t, 49)
+
+	late := newLotRecorder()
+	hub.RegisterBackendListener() <- NewBackendListener("late", late.handle)
+	late.waitFor(t, 49)
+
+	send(lotsUpTo(50, 99)...)
+	late.waitFor(t, 99)
+
+	if got, want := late.recorded(), lotsUpTo(49, 99); !reflect.DeepEqual(got, want) {
+		t.Errorf("late listener saw lots %v, want the cached 49 then 50..99 in order", got)
+	}
+}
+
 func TestHubKeepsDeliveringWhileOneListenerBlocks(t *testing.T) {
 	hub, send := startHub(t)
 	release := make(chan struct{})
