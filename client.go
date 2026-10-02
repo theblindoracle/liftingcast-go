@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -74,11 +74,8 @@ type ClientStatus struct {
 // rejects it. Each connection gets its own ping and timeout goroutines, which
 // stop when that connection ends.
 type Client struct {
-	// Connection configuration
-	baseURL  string
-	meetID   string
-	password string
-	apiKey   string
+	cfg Config
+	log *slog.Logger
 
 	// Current WebSocket connection, replaced on each reconnect, and whether
 	// Start has run
@@ -106,14 +103,13 @@ type Client struct {
 	backoff time.Duration
 }
 
-// NewClient creates a LiftingCast WebSocket client. It does not connect
-// until Start is called.
-func NewClient(baseURL, meetID, password, apiKey string) *Client {
+// NewClient creates a LiftingCast WebSocket client for the meet and
+// credentials in cfg. It does not connect until Start is called.
+func NewClient(cfg Config, opts ...Option) *Client {
+	o := newOptions(opts)
 	return &Client{
-		baseURL:          baseURL,
-		meetID:           meetID,
-		password:         password,
-		apiKey:           apiKey,
+		cfg:              cfg,
+		log:              o.logger.With("meetID", cfg.MeetID),
 		messages:         make(chan json.RawMessage, 10),
 		stop:             make(chan struct{}),
 		pingInterval:     pingInterval,
@@ -148,7 +144,7 @@ func (c *Client) run() {
 			return
 		}
 		if err != nil {
-			log.Printf("Failed to connect to LiftingCast: %v", err)
+			c.log.Warn("failed to connect to LiftingCast", "err", err)
 		} else {
 			c.setStatus(ClientStatus{Connected: true})
 			var resetBackoff bool
@@ -163,7 +159,7 @@ func (c *Client) run() {
 			if resetBackoff {
 				c.backoff = c.initialBackoff
 			}
-			log.Printf("LiftingCast connection dropped: %v", err)
+			c.log.Warn("LiftingCast connection dropped", "err", err)
 		}
 		if isRejected(err) {
 			c.setStatus(ClientStatus{Rejected: true, LastError: err.Error()})
@@ -172,7 +168,7 @@ func (c *Client) run() {
 		}
 		c.setStatus(ClientStatus{LastError: err.Error()})
 
-		log.Printf("Attempting to reconnect in %v", c.backoff)
+		c.log.Info("reconnecting to LiftingCast", "after", c.backoff)
 		select {
 		case <-time.After(c.backoff):
 		case <-c.stop:
@@ -191,7 +187,7 @@ func (c *Client) dial() (*websocket.Conn, error) {
 		return nil, fmt.Errorf("failed to build URL: %w", err)
 	}
 
-	log.Printf("Connecting to LiftingCast API for meet %s", c.meetID)
+	c.log.Info("connecting to LiftingCast")
 
 	// gorilla/websocket stops watching ctx once the TCP connection is up, so
 	// Close interrupts the handshake by closing that connection itself.
@@ -242,7 +238,7 @@ func (c *Client) dial() (*websocket.Conn, error) {
 		}
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
-	log.Println("Liftingcast connection established successfully")
+	c.log.Info("connected to LiftingCast")
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -256,19 +252,19 @@ func (c *Client) dial() (*websocket.Conn, error) {
 
 // buildURL constructs the WebSocket URL with query parameters
 func (c *Client) buildURL() (string, error) {
-	u, err := url.Parse(c.baseURL)
+	u, err := url.Parse(c.cfg.BaseURL)
 	if err != nil {
 		return "", err
 	}
 
 	// Build auth parameter: base64(meetId:password)
-	auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", c.meetID, c.password)))
+	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.MeetID + ":" + c.cfg.Password))
 
 	// Add query parameters
 	q := u.Query()
-	q.Set("meetId", c.meetID)
+	q.Set("meetId", c.cfg.MeetID)
 	q.Set("auth", auth)
-	q.Set("apiKey", c.apiKey)
+	q.Set("apiKey", c.cfg.APIKey)
 	u.RawQuery = q.Encode()
 
 	return u.String(), nil
@@ -341,8 +337,6 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) (meetS
 
 	// Check for pong response
 	if msgStr == "pong" {
-		// Heartbeat response - just log it
-		log.Println("Received pong from LiftingCast")
 		// Signal heartbeat for timeout monitoring
 		signal(heartbeat)
 		return false, nil
@@ -350,14 +344,14 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) (meetS
 
 	// Check the message is meet-state JSON, but pass on the raw bytes so the
 	// cache can tell which fields it left out
-	var meetData *MeetApiResponse
+	var meetData *MeetState
 	err = json.Unmarshal(message, &meetData)
 	if err == nil && meetData == nil {
 		err = errors.New("message is null")
 	}
 	if err != nil {
 		// Not meet-state JSON - treat as error message
-		log.Printf("error unmarshalling Liftingcast message: %s", err)
+		c.log.Warn("LiftingCast sent a server error", "message", msgStr)
 		err = fmt.Errorf("server error: %s", msgStr)
 		if permanentServerErrors[msgStr] {
 			err = rejectedError{err}
@@ -388,7 +382,7 @@ func (c *Client) pingPump(conn *websocket.Conn, done <-chan struct{}) {
 		case <-ticker.C:
 			if err := sendPing(conn); err != nil {
 				// The failed write breaks the connection; serve sees it.
-				log.Printf("Failed to send ping: %v", err)
+				c.log.Warn("failed to send ping", "err", err)
 				return
 			}
 		case <-done:
@@ -415,7 +409,7 @@ func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, hear
 		case <-heartbeat:
 			timer.Reset(c.messageTimeout)
 		case <-timer.C:
-			log.Println("Connection timeout - no messages received")
+			c.log.Warn("LiftingCast connection timed out", "after", c.messageTimeout)
 			conn.Close()
 			return true
 		case <-done:

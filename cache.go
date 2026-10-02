@@ -21,7 +21,7 @@ type Cache struct {
 	mu sync.RWMutex
 
 	// state is the meet state as raw JSON per section; data is the same state
-	// encoded, which Get and Merge decode into fresh MeetApiResponses.
+	// encoded, which Get and Merge decode into fresh MeetStates.
 	state map[string]json.RawMessage
 	data  []byte
 }
@@ -34,8 +34,8 @@ func NewCache() *Cache {
 // Merge replaces each section a raw JSON message carries in the cached state
 // and returns a copy of the result, which the caller may modify. A message
 // that is not a JSON object, or that would leave a state not decodable as
-// MeetApiResponse, is rejected and leaves the cache unchanged.
-func (c *Cache) Merge(update []byte) (*MeetApiResponse, error) {
+// MeetState, is rejected and leaves the cache unchanged.
+func (c *Cache) Merge(update []byte) (*MeetState, error) {
 	var sections map[string]json.RawMessage
 	if err := json.Unmarshal(update, &sections); err != nil {
 		return nil, err
@@ -66,7 +66,7 @@ func (c *Cache) Merge(update []byte) (*MeetApiResponse, error) {
 }
 
 // Get returns a copy of the current cached state
-func (c *Cache) Get() *MeetApiResponse {
+func (c *Cache) Get() *MeetState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -87,8 +87,8 @@ func (c *Cache) Clear() {
 	c.data = nil
 }
 
-func decodeMeetData(data []byte) (*MeetApiResponse, error) {
-	var result MeetApiResponse
+func decodeMeetData(data []byte) (*MeetState, error) {
+	var result MeetState
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
 	}

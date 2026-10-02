@@ -68,8 +68,3 @@ func (nf NullableFloat64) MarshalJSON() ([]byte, error) {
 func (nf NullableFloat64) Float64() *float64 {
 	return nf.Value
 }
-
-// ToFloat64Ptr converts NullableFloat64 to *float64 for convenience
-func (nf NullableFloat64) ToFloat64Ptr() *float64 {
-	return nf.Value
-}
