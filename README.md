@@ -47,6 +47,8 @@ for raw := range client.Messages() { // closed by Close
 
 The library logs nothing unless given a logger: `liftingcast.NewHub(liftingcast.WithLogger(slog.Default()))`. A `Hub` passes its logger on to its `Client`.
 
+A `Client` waits 2s before its first reconnect attempt, doubling each time up to 5s. `WithMaxBackoff` changes that cap, for a `Client` or for the `Client` a `Hub` starts: `liftingcast.NewHub(liftingcast.WithMaxBackoff(30 * time.Second))`. On Hosted LiftingCast, two connections sharing an API key push each other off; a higher cap slows how often that happens.
+
 The API is unstable until v1.
 
 ## Releasing

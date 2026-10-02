@@ -26,8 +26,8 @@ const (
 	// Initial backoff for reconnection
 	initialBackoff = 2 * time.Second
 
-	// Longest wait between reconnect attempts
-	maxBackoff = 30 * time.Second
+	// Default longest wait between reconnect attempts, see WithMaxBackoff
+	maxBackoff = 5 * time.Second
 
 	// Longest a dial may take, from TCP connect to WebSocket handshake
 	handshakeTimeout = 10 * time.Second
@@ -71,8 +71,9 @@ type ClientStatus struct {
 //
 // Once started it dials, and redials with backoff whenever a dial fails or a
 // connection drops or times out, until Close is called or LiftingCast
-// rejects it. Each connection gets its own ping and timeout goroutines, which
-// stop when that connection ends.
+// rejects it. The wait starts at 2s and doubles up to a cap, 5s unless set
+// with WithMaxBackoff. Each connection gets its own ping and timeout
+// goroutines, which stop when that connection ends.
 type Client struct {
 	cfg Config
 	log *slog.Logger
@@ -104,7 +105,8 @@ type Client struct {
 }
 
 // NewClient creates a LiftingCast WebSocket client for the meet and
-// credentials in cfg. It does not connect until Start is called.
+// credentials in cfg. It does not connect until Start is called. Its
+// reconnect backoff is capped at 5s unless opts include WithMaxBackoff.
 func NewClient(cfg Config, opts ...Option) *Client {
 	o := newOptions(opts)
 	return &Client{
@@ -115,7 +117,7 @@ func NewClient(cfg Config, opts ...Option) *Client {
 		pingInterval:     pingInterval,
 		messageTimeout:   messageTimeout,
 		initialBackoff:   initialBackoff,
-		maxBackoff:       maxBackoff,
+		maxBackoff:       o.maxBackoff,
 		handshakeTimeout: handshakeTimeout,
 	}
 }
@@ -137,7 +139,7 @@ func (c *Client) Start() {
 // waits for Close.
 func (c *Client) run() {
 	defer close(c.messages)
-	c.backoff = c.initialBackoff
+	c.resetBackoff()
 	for {
 		conn, err := c.dial()
 		if errors.Is(err, errClientClosed) {
@@ -157,7 +159,7 @@ func (c *Client) run() {
 			// one connection Hosted LiftingCast allows from each other would
 			// never slow down.
 			if resetBackoff {
-				c.backoff = c.initialBackoff
+				c.resetBackoff()
 			}
 			c.log.Warn("LiftingCast connection dropped", "err", err)
 		}
@@ -176,6 +178,12 @@ func (c *Client) run() {
 		}
 		c.backoff = min(c.backoff*2, c.maxBackoff)
 	}
+}
+
+// resetBackoff sets the wait before the next dial back to the initial
+// backoff, or to the cap if that is lower.
+func (c *Client) resetBackoff() {
+	c.backoff = min(c.initialBackoff, c.maxBackoff)
 }
 
 // dial makes one attempt to open a new connection and make it the current
