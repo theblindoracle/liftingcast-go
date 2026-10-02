@@ -20,6 +20,14 @@ _Avoid_: socket, session
 Whether the upstream connection is connected right now, whether it has been rejected, and the most recent error it saw. A server error stays the most recent error through the disconnect that follows it. Connected means LiftingCast accepted the connection, not that the credentials are known to be good. It describes the connection itself, not how far consumers have got through the meet states already sent to them.
 _Avoid_: health, online
 
+**Reconnect**:
+LiftingCast accepting an upstream connection after a time without one: after a drop, and also for a new upstream connection's first acceptance. Meet states sent around a reconnect may have missed whatever happened during the gap.
+_Avoid_: resume, recovery
+
+**Receive time**:
+When the message a meet state was built from was read off the upstream connection. A meet state handed to a listener later, such as the current meet state given to a new listener, keeps its original receive time.
+_Avoid_: timestamp, delivery time
+
 **Server error**:
 A message LiftingCast sends on an upstream connection that is not meet state. Most are temporary: they set the last error, and the connection stays connected or reconnects as usual. A few are known to be permanent, and those reject the connection.
 

@@ -6,3 +6,4 @@ The Client records its own connection status (connected, last error) in the goro
 
 - Status describes the connection right now, even when meet states sent before a drop haven't been consumed yet.
 - Nothing can react to status changes without polling. If something needs to, add a change signal next to `Status()` (e.g. `StatusChanged() <-chan struct{}`) rather than replacing it with an event stream.
+- Telling which connection a meet state arrived on is not status and doesn't conflict with this decision. Each meet state carries it, because a separate signal can't be lined up with states a listener hasn't consumed yet (#13).
