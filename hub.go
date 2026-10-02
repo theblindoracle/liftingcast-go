@@ -110,7 +110,9 @@ type listenRequest struct {
 }
 
 // NewHub creates a hub with no upstream connection and starts its loop. Call
-// Connect to follow a meet, and Close when done with the hub.
+// Connect to follow a meet, and Close when done with the hub. WithLogger and
+// WithMaxBackoff in opts are passed on to every Client it starts; without
+// WithMaxBackoff their reconnect backoff is capped at 5s.
 func NewHub(opts ...Option) *Hub {
 	hub := &Hub{
 		opts:      newOptions(opts),
@@ -322,7 +324,7 @@ func (h *Hub) handleConnect(cfg *Config) {
 // startClient starts a new upstream connection and forwards its messages to
 // the loop until it is closed or the hub has closed.
 func (h *Hub) startClient(cfg Config) *Client {
-	client := NewClient(cfg, WithLogger(h.opts.logger))
+	client := NewClient(cfg, WithLogger(h.opts.logger), WithMaxBackoff(h.opts.maxBackoff))
 	if h.tuneClient != nil {
 		h.tuneClient(client)
 	}

@@ -3,6 +3,7 @@ package liftingcast
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -406,6 +407,17 @@ func TestHubReportsDisconnectedAfterDropEvenWithStatesQueued(t *testing.T) {
 	if status := hub.Status(); status.Connected {
 		t.Errorf("status = %+v after the drop, want disconnected until the client reconnects", status)
 	}
+}
+
+func TestHubPassesMaxBackoffToItsClients(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.refuse.Store(http.StatusServiceUnavailable)
+	hub := NewHub(WithMaxBackoff(30 * time.Millisecond))
+	t.Cleanup(hub.Close)
+	hub.Connect(testConfig(srv.url))
+
+	// Without the option, the client would wait 2s before its second attempt
+	expectGapsAtMost(t, srv, 30*time.Millisecond)
 }
 
 func TestHubReportsRejection(t *testing.T) {
