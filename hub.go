@@ -1,8 +1,8 @@
 package liftingcast
 
 import (
-	"encoding/json"
 	"sync"
+	"time"
 )
 
 // HubStatus is the connection status of a Hub's upstream connection (see
@@ -15,6 +15,31 @@ type HubStatus struct {
 	MeetID    string `json:"meetId"`
 	MeetName  string `json:"meetName"`
 	LastError string `json:"error,omitempty"`
+
+	// LastMeetStateAt is the receive time of the last meet state merged
+	// from the upstream connection, or zero if there has been none yet.
+	// Reconnects leave it as it is; Connect and Disconnect reset it.
+	LastMeetStateAt time.Time `json:"lastMeetStateAt,omitzero"`
+}
+
+// Update is one meet state handed to a listener, with the connection it
+// arrived on and when it was received.
+type Update struct {
+	// State is the full merged meet state, shared with every listener: see
+	// Listen.
+	State *MeetState
+
+	// Connection numbers the upstream connection the state arrived on,
+	// across every connection the Hub has made. It never repeats or goes
+	// backwards, and rises on every reconnect: a redial after a drop, and
+	// the first connection after Connect. Any change means a gap, however
+	// short, in which states may have been missed.
+	Connection uint64
+
+	// ReceivedAt is when the message that produced State was received
+	// (see Message). The current state handed to a new listener keeps its
+	// original ReceivedAt.
+	ReceivedAt time.Time
 }
 
 // Hub keeps one upstream LiftingCast connection alive, merges its messages
@@ -39,14 +64,27 @@ type Hub struct {
 	// Shared cache for meet data
 	cache *Cache
 
-	// Single persistent upstream LiftingCast connection and its meet. Only
-	// the loop changes them, under upstreamMu, so Status can read them.
+	// Single persistent upstream LiftingCast connection, its meet and the
+	// last update handed out from it, the zero Update before the first.
+	// Only the loop changes them, under upstreamMu, so Status can read
+	// them.
 	upstreamMu     sync.RWMutex
 	upstreamClient *Client
 	meetID         string
+	latest         Update
+
+	// Turn the current client's connection numbers into the Hub's, which
+	// only go up: connectionBase is added to them, and lastConnection is
+	// the highest the Hub has handed out. Only the loop uses them.
+	connectionBase uint64
+	lastConnection uint64
 
 	// Carries Connect's and Disconnect's requests to the loop
 	connect chan connectRequest
+
+	// tuneClient, if set, adjusts each new client before it starts. Tests
+	// use it to shorten the client's timings.
+	tuneClient func(*Client)
 
 	// closing is closed by the first Close, which then waits for the loop to
 	// shut down and close closed. The loop leaves the listeners it stopped
@@ -113,9 +151,11 @@ func (h *Hub) run() {
 
 // Listen calls handler with every meet state from now on, in order, until the
 // returned stop is called or the Hub is closed. The first state is the
-// current meet state if there is one; after that no state is skipped,
-// repeated or older than the one before. Listen returns once the listener is
-// in place, so every state merged after it returns reaches handler.
+// current meet state if there is one, with its original Connection and
+// ReceivedAt; after that no state is skipped, repeated or older than the one
+// before. Listen returns once the listener is in place, so every state
+// merged after it returns reaches handler. A change in Update.Connection
+// from one state to the next means there was a reconnect between them.
 //
 // Every listener is handed the same state, concurrently, so handler must
 // treat it as read-only. The Hub never modifies a state once it has handed
@@ -132,7 +172,7 @@ func (h *Hub) run() {
 // progress, since a handler waiting for itself, or two handlers waiting for
 // each other, would never return. After Close, Listen never calls handler
 // and returns a stop that does nothing.
-func (h *Hub) Listen(handler func(*MeetState)) (stop func()) {
+func (h *Hub) Listen(handler func(Update)) (stop func()) {
 	l := newListener(handler)
 	req := listenRequest{listener: l, registered: make(chan struct{})}
 	select {
@@ -204,6 +244,7 @@ func (h *Hub) shutdown() {
 	h.upstreamMu.Lock()
 	h.upstreamClient = nil
 	h.meetID = ""
+	h.latest = Update{}
 	h.upstreamMu.Unlock()
 	h.cache.Clear()
 
@@ -221,7 +262,7 @@ func (h *Hub) shutdown() {
 // the zero HubStatus.
 func (h *Hub) Status() HubStatus {
 	h.upstreamMu.RLock()
-	client, meetID := h.upstreamClient, h.meetID
+	client, meetID, lastMeetStateAt := h.upstreamClient, h.meetID, h.latest.ReceivedAt
 	h.upstreamMu.RUnlock()
 
 	var clientStatus ClientStatus
@@ -229,10 +270,11 @@ func (h *Hub) Status() HubStatus {
 		clientStatus = client.Status()
 	}
 	status := HubStatus{
-		Connected: clientStatus.Connected,
-		Rejected:  clientStatus.Rejected,
-		MeetID:    meetID,
-		LastError: clientStatus.LastError,
+		Connected:       clientStatus.Connected,
+		Rejected:        clientStatus.Rejected,
+		MeetID:          meetID,
+		LastError:       clientStatus.LastError,
+		LastMeetStateAt: lastMeetStateAt,
 	}
 
 	// Try to get meet name from cache
@@ -255,8 +297,14 @@ func (h *Hub) handleConnect(cfg *Config) {
 		h.upstreamMu.Unlock()
 	}
 
-	// Clear cache
+	// Clear cache and the last update
 	h.cache.Clear()
+	h.upstreamMu.Lock()
+	h.latest = Update{}
+	h.upstreamMu.Unlock()
+
+	// The next client's connections number on from the highest so far
+	h.connectionBase = h.lastConnection
 
 	// Disconnect leaves the hub without an upstream connection
 	if cfg == nil {
@@ -277,11 +325,14 @@ func (h *Hub) handleConnect(cfg *Config) {
 // the loop until it is closed or the hub has closed.
 func (h *Hub) startClient(cfg Config) *Client {
 	client := NewClient(cfg, WithLogger(h.opts.logger), WithMaxBackoff(h.opts.maxBackoff))
+	if h.tuneClient != nil {
+		h.tuneClient(client)
+	}
 	client.Start()
 	go func() {
-		for raw := range client.Messages() {
+		for msg := range client.Messages() {
 			select {
-			case h.upstream <- upstreamMessage{client: client, raw: raw}:
+			case h.upstream <- upstreamMessage{client: client, msg: msg}:
 			case <-h.closed:
 				return
 			}
@@ -290,10 +341,10 @@ func (h *Hub) startClient(cfg Config) *Client {
 	return client
 }
 
-// upstreamMessage is one raw message and the client it arrived on
+// upstreamMessage is one message and the client it arrived on
 type upstreamMessage struct {
 	client *Client
-	raw    json.RawMessage
+	msg    Message
 }
 
 // handleUpstreamMessage merges a message into the cache and queues the
@@ -305,31 +356,43 @@ func (h *Hub) handleUpstreamMessage(msg upstreamMessage) {
 		return
 	}
 
-	merged, err := h.cache.Merge(msg.raw)
+	merged, err := h.cache.Merge(msg.msg.Raw)
 	if err != nil {
 		h.opts.logger.Warn("failed to merge meet state", "meetID", h.meetID, "err", err)
 		return
 	}
 
-	h.broadcast(merged)
+	// A client's connection numbers only go up, so the Hub's do too
+	h.lastConnection = h.connectionBase + msg.msg.Connection
+	update := Update{
+		State:      merged,
+		Connection: h.lastConnection,
+		ReceivedAt: msg.msg.ReceivedAt,
+	}
+	h.upstreamMu.Lock()
+	h.latest = update
+	h.upstreamMu.Unlock()
+
+	h.broadcast(update)
 }
 
-// broadcast queues a merged state for every listener
-func (h *Hub) broadcast(state *MeetState) {
+// broadcast queues an update for every listener
+func (h *Hub) broadcast(update Update) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	for l := range h.listeners {
-		l.enqueue(state)
+		l.enqueue(update)
 	}
 }
 
-// addListener starts delivering to a new listener, beginning with the cached
-// state if there is one. Only the loop calls it, so no merge can land
-// between reading the cache and the listener joining the next broadcast.
+// addListener starts delivering to a new listener, beginning with the last
+// update if there is one. Only the loop calls it, so no merge can land
+// between reading the last update and the listener joining the next
+// broadcast.
 func (h *Hub) addListener(l *listener) {
-	if cached := h.cache.Get(); cached != nil {
-		l.enqueue(cached)
+	if h.latest.State != nil {
+		l.enqueue(h.latest)
 	}
 	l.start()
 

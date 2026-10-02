@@ -498,8 +498,72 @@ func TestClientStaysConnectedOnServerError(t *testing.T) {
 	}
 	select {
 	case m := <-c.Messages():
-		t.Errorf("Messages got %s, want server errors kept off it", m)
+		t.Errorf("Messages got %s, want server errors kept off it", m.Raw)
 	default:
+	}
+}
+
+// nextMessage returns the next message on Messages.
+func nextMessage(t *testing.T, c *Client) Message {
+	t.Helper()
+	select {
+	case msg := <-c.Messages():
+		return msg
+	case <-time.After(time.Second):
+		t.Fatal("no meet state")
+		return Message{}
+	}
+}
+
+func TestClientNumbersEachAcceptedConnection(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	send := func(conn *websocket.Conn) {
+		t.Helper()
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"name": "Test Meet"}`)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+
+	first := srv.accept(t, time.Second)
+	send(first)
+	send(first)
+	for i := 0; i < 2; i++ {
+		if msg := nextMessage(t, c); msg.Connection != 1 {
+			t.Errorf("message %d on the first connection has Connection %d, want 1", i+1, msg.Connection)
+		}
+	}
+
+	// The second connection is accepted but sends nothing; it still counts.
+	first.Close()
+	srv.accept(t, time.Second).Close()
+	third := srv.accept(t, time.Second)
+	send(third)
+	if msg := nextMessage(t, c); msg.Connection != 3 {
+		t.Errorf("message on the third connection has Connection %d, want 3", msg.Connection)
+	}
+}
+
+func TestClientStampsMessagesWhenRead(t *testing.T) {
+	srv := newFakeServer(t)
+	c := newTestClient(t, srv.url, time.Hour, time.Hour)
+	conn := srv.accept(t, time.Second)
+
+	sent := time.Now()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"name": "Test Meet"}`)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	// Leave the message unread on Messages for a while: ReceivedAt is when
+	// it came off the WebSocket, not when it is taken from Messages.
+	time.Sleep(100 * time.Millisecond)
+	taken := time.Now()
+	msg := nextMessage(t, c)
+
+	if msg.ReceivedAt.Before(sent) || !msg.ReceivedAt.Before(taken.Add(-50*time.Millisecond)) {
+		t.Errorf("ReceivedAt = %v, want soon after it was sent at %v and well before it was taken at %v", msg.ReceivedAt, sent, taken)
+	}
+	if string(msg.Raw) != `{"name": "Test Meet"}` {
+		t.Errorf("Raw = %s, want the message exactly as sent", msg.Raw)
 	}
 }
 

@@ -1,9 +1,11 @@
 package liftingcast
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +19,7 @@ func TestHubHandsMergedStateToListeners(t *testing.T) {
 	t.Cleanup(hub.Close)
 
 	states := make(chan *MeetState, 10)
-	hub.Listen(func(m *MeetState) { states <- m })
+	hub.Listen(func(u Update) { states <- u.State })
 
 	conn := srv.accept(t, time.Second)
 	send := func(raw string) {
@@ -57,7 +59,7 @@ func TestHubConnectReplacesTheUpstreamConnection(t *testing.T) {
 	hub := NewHub()
 	t.Cleanup(hub.Close)
 	states := make(chan *MeetState, 10)
-	hub.Listen(func(m *MeetState) { states <- m })
+	hub.Listen(func(u Update) { states <- u.State })
 	next := func() *MeetState {
 		t.Helper()
 		select {
@@ -149,8 +151,8 @@ func newLotRecorder() *lotRecorder {
 	return &lotRecorder{seen: make(chan int, 1024)}
 }
 
-func (r *lotRecorder) handle(m *MeetState) {
-	lot := *m.Lifters["l1"].Lot
+func (r *lotRecorder) handle(u Update) {
+	lot := *u.State.Lifters["l1"].Lot
 	r.mu.Lock()
 	r.lots = append(r.lots, lot)
 	r.mu.Unlock()
@@ -182,10 +184,10 @@ func (r *lotRecorder) waitFor(t *testing.T, lot int) {
 // blockingRecorder returns a handler that records each state with rec and
 // then blocks in its first call until release is closed, so later states
 // queue up behind it.
-func blockingRecorder(rec *lotRecorder, release <-chan struct{}) func(*MeetState) {
+func blockingRecorder(rec *lotRecorder, release <-chan struct{}) func(Update) {
 	var once sync.Once
-	return func(m *MeetState) {
-		rec.handle(m)
+	return func(u Update) {
+		rec.handle(u)
 		once.Do(func() { <-release })
 	}
 }
@@ -289,7 +291,7 @@ func TestHubKeepsDeliveringWhileOneListenerBlocks(t *testing.T) {
 	hub, send := startHub(t)
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	hub.Listen(func(*MeetState) { <-release })
+	hub.Listen(func(Update) { <-release })
 	rec := newLotRecorder()
 	hub.Listen(rec.handle)
 
@@ -348,8 +350,8 @@ func TestHubStopFromInsideHandler(t *testing.T) {
 	stops := make(chan func(), 1)
 	returned := make(chan struct{})
 	var once sync.Once
-	stops <- hub.Listen(func(m *MeetState) {
-		rec.handle(m)
+	stops <- hub.Listen(func(u Update) {
+		rec.handle(u)
 		once.Do(func() {
 			(<-stops)()
 			close(returned)
@@ -472,7 +474,7 @@ func TestHubCloseFromInsideHandler(t *testing.T) {
 	hub, send := startHub(t)
 	returned := make(chan struct{})
 	var once sync.Once
-	hub.Listen(func(*MeetState) {
+	hub.Listen(func(Update) {
 		once.Do(func() {
 			hub.Close()
 			close(returned)
@@ -499,9 +501,9 @@ func TestHubHandlersStoppingEachOtherDontDeadlock(t *testing.T) {
 	bothIn := sync.WaitGroup{}
 	bothIn.Add(2)
 	returned := make(chan struct{}, 2)
-	crossStop := func(other *func()) func(*MeetState) {
+	crossStop := func(other *func()) func(Update) {
 		var once sync.Once
-		return func(*MeetState) {
+		return func(Update) {
 			once.Do(func() {
 				<-ready
 				bothIn.Done()
@@ -532,9 +534,9 @@ func TestHubHandlersClosingTogetherDontDeadlock(t *testing.T) {
 	var bothIn sync.WaitGroup
 	bothIn.Add(2)
 	returned := make(chan struct{}, 2)
-	closeOnce := func() func(*MeetState) {
+	closeOnce := func() func(Update) {
 		var once sync.Once
-		return func(*MeetState) {
+		return func(Update) {
 			once.Do(func() {
 				bothIn.Done()
 				bothIn.Wait()
@@ -570,7 +572,7 @@ func TestHubDoesNothingAfterClose(t *testing.T) {
 	hub.Close()
 
 	called := make(chan struct{}, 1)
-	stop := hub.Listen(func(*MeetState) { called <- struct{}{} })
+	stop := hub.Listen(func(Update) { called <- struct{}{} })
 	hub.Connect(testConfig(srv.url))
 	srv.expectNoAttempt(t, 100*time.Millisecond)
 	hub.Disconnect()
@@ -591,6 +593,176 @@ func TestHubCloseTwiceIsHarmless(t *testing.T) {
 	hub := NewHub()
 	hub.Close()
 	hub.Close()
+}
+
+// newQuickHub returns a hub with no upstream connection whose clients
+// reconnect after 10ms, far quicker than anything would poll Status.
+func newQuickHub(t *testing.T) *Hub {
+	t.Helper()
+	hub := NewHub()
+	hub.tuneClient = func(c *Client) {
+		c.initialBackoff = 10 * time.Millisecond
+		c.maxBackoff = 10 * time.Millisecond
+	}
+	t.Cleanup(hub.Close)
+	return hub
+}
+
+// listenForUpdates adds a listener to hub and returns a function that
+// returns the next update it is handed.
+func listenForUpdates(t *testing.T, hub *Hub) func() Update {
+	t.Helper()
+	updates := make(chan Update, 100)
+	hub.Listen(func(u Update) { updates <- u })
+	return func() Update {
+		t.Helper()
+		select {
+		case u := <-updates:
+			return u
+		case <-time.After(time.Second):
+			t.Fatal("listener received no update")
+			return Update{}
+		}
+	}
+}
+
+// sendName sends conn a message setting the meet name.
+func sendName(t *testing.T, conn *websocket.Conn, name string) {
+	t.Helper()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"name": %q}`, name))); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
+func TestHubUpdateConnectionRisesAfterQuickReconnect(t *testing.T) {
+	srv := newFakeServer(t)
+	hub := newQuickHub(t)
+	next := listenForUpdates(t, hub)
+	hub.Connect(testConfig(srv.url))
+
+	first := srv.accept(t, time.Second)
+	sendName(t, first, "before")
+	sendName(t, first, "still before")
+	before, stillBefore := next(), next()
+	if before.Connection == 0 || stillBefore.Connection != before.Connection {
+		t.Fatalf("connections = %d, %d, want the same non-zero number for one connection", before.Connection, stillBefore.Connection)
+	}
+
+	first.Close()
+	second := srv.accept(t, time.Second)
+	waitForHubStatus(t, hub, func(s HubStatus) bool { return s.Connected })
+	if at := hub.Status().LastMeetStateAt; !at.Equal(stillBefore.ReceivedAt) {
+		t.Errorf("LastMeetStateAt = %v after the reconnect, want %v kept from before it", at, stillBefore.ReceivedAt)
+	}
+	sendName(t, second, "after")
+	after := next()
+	if after.State.Name != "after" || after.Connection <= before.Connection {
+		t.Errorf("update after the reconnect = %q on connection %d, want a higher connection than %d", after.State.Name, after.Connection, before.Connection)
+	}
+	if after.ReceivedAt.Before(stillBefore.ReceivedAt) {
+		t.Errorf("ReceivedAt went backwards: %v after %v", after.ReceivedAt, stillBefore.ReceivedAt)
+	}
+}
+
+func TestHubUpdateConnectionRisesAfterConnect(t *testing.T) {
+	srv := newFakeServer(t)
+	hub := newQuickHub(t)
+	next := listenForUpdates(t, hub)
+	var last uint64
+	expectHigher := func(u Update) {
+		t.Helper()
+		if u.Connection <= last {
+			t.Errorf("update %q has connection %d, want higher than %d", u.State.Name, u.Connection, last)
+		}
+		last = u.Connection
+	}
+
+	// Two connections on the first client, then Connect to the same meet:
+	// the new client's first connection must not reuse either number.
+	cfg := testConfig(srv.url)
+	hub.Connect(cfg)
+	conn := srv.accept(t, time.Second)
+	sendName(t, conn, "a1")
+	expectHigher(next())
+	conn.Close()
+	sendName(t, srv.accept(t, time.Second), "a2")
+	expectHigher(next())
+
+	hub.Connect(cfg)
+	if at := hub.Status().LastMeetStateAt; !at.IsZero() {
+		t.Errorf("LastMeetStateAt = %v after Connect, want zero until the first state", at)
+	}
+	sendName(t, srv.accept(t, time.Second), "b1")
+	expectHigher(next())
+
+	hub.Disconnect()
+	hub.Connect(Config{BaseURL: srv.url, MeetID: "other"})
+	sendName(t, srv.accept(t, time.Second), "c1")
+	expectHigher(next())
+}
+
+func TestHubLateListenerGetsCurrentStateAsReceived(t *testing.T) {
+	hub, send := startHub(t)
+	next := listenForUpdates(t, hub)
+	send(0)
+	original := next()
+
+	time.Sleep(20 * time.Millisecond)
+	late := listenForUpdates(t, hub)()
+	if late.State != original.State || late.Connection != original.Connection || !late.ReceivedAt.Equal(original.ReceivedAt) {
+		t.Errorf("late listener's first update = %+v, want the current state as first handed out, %+v", late, original)
+	}
+}
+
+func TestHubStatusReportsLastMeetStateAt(t *testing.T) {
+	hub, send := startHub(t)
+	waitForHubStatus(t, hub, func(s HubStatus) bool { return s.Connected })
+	if at := hub.Status().LastMeetStateAt; !at.IsZero() {
+		t.Errorf("LastMeetStateAt = %v before any meet state, want zero", at)
+	}
+
+	next := listenForUpdates(t, hub)
+	send(0, 1)
+	next()
+	last := next()
+	if at := hub.Status().LastMeetStateAt; at.IsZero() || !at.Equal(last.ReceivedAt) {
+		t.Errorf("LastMeetStateAt = %v, want the last state's ReceivedAt %v", at, last.ReceivedAt)
+	}
+
+	hub.Disconnect()
+	if at := hub.Status().LastMeetStateAt; !at.IsZero() {
+		t.Errorf("LastMeetStateAt = %v after Disconnect, want zero", at)
+	}
+}
+
+func TestHubStatusLastMeetStateAtZeroAfterClose(t *testing.T) {
+	hub, send := startHub(t)
+	next := listenForUpdates(t, hub)
+	send(0)
+	next()
+	hub.Close()
+	if status := hub.Status(); status != (HubStatus{}) {
+		t.Errorf("status = %+v after Close, want the zero status", status)
+	}
+}
+
+func TestHubStatusJSONOmitsZeroLastMeetStateAt(t *testing.T) {
+	encode := func(s HubStatus) string {
+		t.Helper()
+		b, err := json.Marshal(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	if got := encode(HubStatus{}); strings.Contains(got, "lastMeetStateAt") {
+		t.Errorf("zero status encodes as %s, want lastMeetStateAt left out", got)
+	}
+	at := time.Date(2026, 10, 2, 9, 30, 0, 0, time.UTC)
+	if got := encode(HubStatus{LastMeetStateAt: at}); !strings.Contains(got, `"lastMeetStateAt":"2026-10-02T09:30:00Z"`) {
+		t.Errorf("status encodes as %s, want lastMeetStateAt set", got)
+	}
 }
 
 // newTestHub returns a hub connected to url

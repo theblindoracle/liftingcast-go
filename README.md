@@ -20,26 +20,36 @@ cfg := liftingcast.Config{
 hub := liftingcast.NewHub() // runs until Close
 defer hub.Close()
 hub.Connect(cfg)
-stop := hub.Listen(func(state *liftingcast.MeetState) {
-	// state is the full merged meet state, shared with every listener:
+var last uint64
+stop := hub.Listen(func(u liftingcast.Update) {
+	// u.State is the full merged meet state, shared with every listener:
 	// read it or keep it, but copy it before modifying it
+	if last != 0 && u.Connection != last {
+		// reconnected since the previous state: anything that happened in
+		// the gap may have been missed
+		log.Printf("reconnected; state received at %v follows a gap", u.ReceivedAt)
+	}
+	last = u.Connection
 })
 defer stop() // once stop returns, the handler is not called again
 ```
 
-Without a `Hub`, merge the `Client`'s raw messages into a `Cache` yourself:
+Each `Update` carries the connection its state arrived on and when it was received (`ReceivedAt`). `Connection` only goes up over the hub's life and changes on every reconnect, including after `Connect`, so a listener sees every gap however short it was. A new listener's first update is the current meet state with its original `Connection` and `ReceivedAt`. `hub.Status()` also reports `LastMeetStateAt`, the receive time of the last meet state.
+
+Without a `Hub`, merge the `Client`'s messages into a `Cache` yourself:
 
 ```go
 client := liftingcast.NewClient(cfg)
 client.Start() // keeps retrying until Close
 defer client.Close()
 cache := liftingcast.NewCache()
-for raw := range client.Messages() { // closed by Close
-	state, err := cache.Merge(raw)
+for msg := range client.Messages() { // closed by Close
+	state, err := cache.Merge(msg.Raw)
 	if err != nil {
 		continue
 	}
-	// state is the full merged meet state, yours to modify
+	// state is the full merged meet state, yours to modify; msg.Connection
+	// is 1 on the first connection and one higher after each reconnect
 }
 ```
 

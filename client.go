@@ -67,6 +67,23 @@ type ClientStatus struct {
 	LastError string
 }
 
+// Message is one meet-state message from LiftingCast, with the connection
+// it arrived on and when it was read.
+type Message struct {
+	// Raw is the message exactly as LiftingCast sent it. Pass it to
+	// Cache.Merge to build the full state.
+	Raw json.RawMessage
+
+	// Connection is which of the Client's connections the message arrived
+	// on. The first connection LiftingCast accepts is 1, and every later
+	// accepted connection is one higher, so a change means a reconnect:
+	// whatever happened during the gap may have been missed.
+	Connection uint64
+
+	// ReceivedAt is when the message was read off the WebSocket.
+	ReceivedAt time.Time
+}
+
 // Client is the upstream connection to LiftingCast for one meet.
 //
 // Once started it dials, and redials with backoff whenever a dial fails or a
@@ -86,7 +103,7 @@ type Client struct {
 
 	// messages carries meet state. Only run sends on it, and closes it when
 	// it exits; Close closes it if run never started.
-	messages chan json.RawMessage
+	messages chan Message
 	stop     chan struct{} // Closed by Close; ends the client for good
 
 	// Connection status, set by run as it sees each change
@@ -100,8 +117,10 @@ type Client struct {
 	maxBackoff       time.Duration
 	handshakeTimeout time.Duration
 
-	// Wait before the next dial, only used by run
-	backoff time.Duration
+	// Wait before the next dial, and the number of the last connection
+	// LiftingCast accepted, only used by run
+	backoff    time.Duration
+	connection uint64
 }
 
 // NewClient creates a LiftingCast WebSocket client for the meet and
@@ -112,7 +131,7 @@ func NewClient(cfg Config, opts ...Option) *Client {
 	return &Client{
 		cfg:              cfg,
 		log:              o.logger.With("meetID", cfg.MeetID),
-		messages:         make(chan json.RawMessage, 10),
+		messages:         make(chan Message, 10),
 		stop:             make(chan struct{}),
 		pingInterval:     pingInterval,
 		messageTimeout:   messageTimeout,
@@ -148,9 +167,10 @@ func (c *Client) run() {
 		if err != nil {
 			c.log.Warn("failed to connect to LiftingCast", "err", err)
 		} else {
+			c.connection++
 			c.setStatus(ClientStatus{Connected: true})
 			var resetBackoff bool
-			resetBackoff, err = c.serve(conn)
+			resetBackoff, err = c.serve(conn, c.connection)
 			if err == nil {
 				return
 			}
@@ -278,14 +298,15 @@ func (c *Client) buildURL() (string, error) {
 	return u.String(), nil
 }
 
-// serve reads from conn until it fails, alongside conn's ping and timeout
-// goroutines, which have stopped by the time it returns. It returns why the
-// connection ended, or nil if the client was closed: the last server error if
-// there was one, since LiftingCast drops the connection right after sending
-// it. A server error known to be permanent ends the connection at once. It
-// also reports whether the backoff should reset: the connection delivered
-// meet state and did not end with a server error.
-func (c *Client) serve(conn *websocket.Conn) (resetBackoff bool, err error) {
+// serve reads from conn, the client's connection number connection, until
+// it fails, alongside conn's ping and timeout goroutines, which have stopped
+// by the time it returns. It returns why the connection ended, or nil if the
+// client was closed: the last server error if there was one, since
+// LiftingCast drops the connection right after sending it. A server error
+// known to be permanent ends the connection at once. It also reports whether
+// the backoff should reset: the connection delivered meet state and did not
+// end with a server error.
+func (c *Client) serve(conn *websocket.Conn, connection uint64) (resetBackoff bool, err error) {
 	done := make(chan struct{})
 	heartbeat := make(chan struct{}, 1)
 	var wg sync.WaitGroup
@@ -304,6 +325,7 @@ func (c *Client) serve(conn *websocket.Conn) (resetBackoff bool, err error) {
 	var serverErr error
 	for {
 		_, message, err := conn.ReadMessage()
+		receivedAt := time.Now()
 		if err != nil {
 			conn.Close()
 			close(done)
@@ -321,7 +343,8 @@ func (c *Client) serve(conn *websocket.Conn) (resetBackoff bool, err error) {
 			return resetBackoff, err
 		}
 
-		meetState, err := c.handleMessage(message, heartbeat)
+		msg := Message{Raw: message, Connection: connection, ReceivedAt: receivedAt}
+		meetState, err := c.handleMessage(msg, heartbeat)
 		if meetState {
 			// The connection survived the server error, so it isn't why the
 			// connection ends
@@ -337,10 +360,11 @@ func (c *Client) serve(conn *websocket.Conn) (resetBackoff bool, err error) {
 	}
 }
 
-// handleMessage processes received messages. It reports whether message was
+// handleMessage processes received messages. It reports whether msg was
 // meet state, or returns the server error if it was one, as a rejectedError
 // if it is known to be permanent.
-func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) (meetState bool, err error) {
+func (c *Client) handleMessage(msg Message, heartbeat chan<- struct{}) (meetState bool, err error) {
+	message := msg.Raw
 	msgStr := string(message)
 
 	// Check for pong response
@@ -370,7 +394,7 @@ func (c *Client) handleMessage(message []byte, heartbeat chan<- struct{}) (meetS
 
 	// Valid meet state
 	select {
-	case c.messages <- json.RawMessage(message):
+	case c.messages <- msg:
 	case <-c.stop:
 		return false, nil
 	}
@@ -463,10 +487,11 @@ func (c *Client) Status() ClientStatus {
 	return c.status
 }
 
-// Messages returns the channel of meet state, each the raw JSON of one
-// message. Pass them to Cache.Merge to build the full state. It is closed
-// once the client is closed and nothing more can be sent on it.
-func (c *Client) Messages() <-chan json.RawMessage {
+// Messages returns the channel of meet state, one Message for each message
+// LiftingCast sent. Pass each one's Raw to Cache.Merge to build the full
+// state. It is closed once the client is closed and nothing more can be sent
+// on it.
+func (c *Client) Messages() <-chan Message {
 	return c.messages
 }
 
