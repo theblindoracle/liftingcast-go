@@ -48,3 +48,11 @@ for raw := range client.Messages() { // closed by Close
 The library logs nothing unless given a logger: `liftingcast.NewHub(liftingcast.WithLogger(slog.Default()))`. A `Hub` passes its logger on to its `Client`.
 
 The API is unstable until v1.
+
+## Releasing
+
+Label the PR before merging it: `release:minor` (v0.3.0 → v0.4.0) or `release:patch` (v0.3.0 → v0.3.1). Once CI passes on `main`, it puts the next annotated `vX.Y.Z` tag on the merge commit. A PR with neither label releases nothing; a PR with both fails the release job. To see the version a label would give, without tagging anything:
+
+```sh
+git tag -l | go run ./internal/nextversion release:minor
+```
