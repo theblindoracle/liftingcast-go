@@ -233,6 +233,49 @@ func TestClientReconnectsPromptlyAfterLongOutage(t *testing.T) {
 	srv.accept(t, c.maxBackoff+150*time.Millisecond)
 }
 
+func TestClientMaxBackoffDefaultsTo5s(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		opts []Option
+	}{
+		{"no option", nil},
+		{"zero", []Option{WithMaxBackoff(0)}},
+		{"negative", []Option{WithMaxBackoff(-time.Second)}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewClient(testConfig("ws://unused"), tt.opts...)
+			if c.maxBackoff != 5*time.Second {
+				t.Errorf("max backoff = %v, want 5s", c.maxBackoff)
+			}
+		})
+	}
+}
+
+func TestClientWithMaxBackoffCapsEveryWait(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.refuse.Store(http.StatusServiceUnavailable)
+	// The cap is below the 2s initial backoff, so it caps the first wait too
+	c := NewClient(testConfig(srv.url), WithMaxBackoff(30*time.Millisecond))
+	t.Cleanup(c.Close)
+	c.Start()
+
+	expectGapsAtMost(t, srv, 30*time.Millisecond)
+}
+
+// expectGapsAtMost fails unless the client's next few attempts each come
+// about limit or less after the one before.
+func expectGapsAtMost(t *testing.T, srv *fakeServer, limit time.Duration) {
+	t.Helper()
+	prev := srv.nextAttempt(t, time.Second)
+	for i := 0; i < 5; i++ {
+		at := srv.nextAttempt(t, time.Second)
+		if gap := at.Sub(prev); gap > 3*limit {
+			t.Fatalf("gap before attempt %d = %v, want at most about %v", i+2, gap, limit)
+		}
+		prev = at
+	}
+}
+
 // silentListener accepts TCP connections but never answers the WebSocket
 // handshake. Each accepted connection is sent on the returned channel.
 func silentListener(t *testing.T) (string, <-chan net.Conn) {
