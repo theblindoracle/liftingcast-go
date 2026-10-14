@@ -501,6 +501,65 @@ func TestOverflowingRecorderDropsEventsAndCountsThem(t *testing.T) {
 	}
 }
 
+func TestFinalEventSurvivesFullQueue(t *testing.T) {
+	srv := newFakeServer(t)
+	rec := newMemRecording()
+	rec.block = make(chan struct{})
+	c := NewClient(testConfig(srv.url), recorderOption(rec, nil))
+	c.Start()
+	server := srv.accept(t, time.Second)
+	for i := 0; i < recorderBuffer*2; i++ {
+		if err := server.WriteMessage(1, []byte(`{"name":"Meet"}`)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-c.Messages():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d messages delivered", i)
+		}
+	}
+	done := make(chan struct{})
+	go func() { c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close stalled on the recording")
+	}
+	close(rec.block)
+	rec.waitClosed(t)
+	events := rec.events(t)
+	if last := events[len(events)-1]; last["event"] != "closed" {
+		t.Fatalf("last event = %v, want closed", last)
+	}
+}
+
+func TestRecordAfterFinishIsIgnored(t *testing.T) {
+	m := newMemRecording()
+	r, err := newRecorder(func(ClientInfo) (io.WriteCloser, error) { return m, nil }, ClientInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.finish(eventClosed)
+	r.record(recordEvent{Event: eventText}) // must not panic
+	r.finish(eventReplaced)
+	m.waitClosed(t)
+	if got := eventNames(m.events(t)); len(got) != 2 || got[1] != "closed" {
+		t.Fatalf("events = %v", got)
+	}
+}
+
+func TestRecorderRejectedHandshakeSharesConnectionNumber(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.refuse.Store(http.StatusUnauthorized)
+	_, rec := startRecorded(t, srv.url)
+	_, events := eventsUntil(t, rec, "rejected")
+	for _, e := range events[1:] {
+		if e["conn"] != float64(1) {
+			t.Errorf("%v: conn = %v, want 1", e["event"], e["conn"])
+		}
+	}
+}
+
 // recordingSet is a RecorderFactory's in-memory recordings, one per Client.
 type recordingSet struct {
 	mu   sync.Mutex

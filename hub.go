@@ -78,10 +78,10 @@ type Hub struct {
 	// the highest the Hub has handed out. Only the loop uses them.
 	connectionBase uint64
 
-	// Number of the last Client's recording, for ClientInfo.Sequence. Only
-	// the loop uses it.
-	sequence       uint64
 	lastConnection uint64
+
+	// Sequence of the last Client's recording. Only the loop uses it.
+	sequence uint64
 
 	// Carries Connect's and Disconnect's requests to the loop
 	connect chan connectRequest

@@ -1,12 +1,8 @@
 package liftingcast
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"io"
-	"net/url"
-	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,8 +12,8 @@ import (
 // before new ones are dropped.
 const recorderBuffer = 64
 
-// ClientInfo describes one Client to the WithRecorder factory, so it can
-// choose where the recording goes. It never holds credentials.
+// ClientInfo tells the WithRecorder factory which Client a recording is for.
+// It never holds credentials.
 type ClientInfo struct {
 	// MeetID is the meet the Client follows.
 	MeetID string
@@ -35,57 +31,46 @@ type ClientInfo struct {
 // closes the writer after the recording's final event.
 type RecorderFactory func(ClientInfo) (io.WriteCloser, error)
 
-// WithRecorder records each Client's upstream connection, see ADR-0004.
-// newWriter is called once for each Client created, and a Client whose
-// factory returns an error runs without a recording. Recording never stalls
-// the live connection: events the writer cannot take are dropped, and a
-// recorder_dropped event says how many.
+// WithRecorder makes each Client keep a recording of its upstream
+// connection, see ADR-0004. newWriter is called once for each Client, and a
+// Client whose factory fails runs without a recording. Events the writer
+// cannot take are dropped, never waited for, and a recorder_dropped event
+// says how many.
 func WithRecorder(newWriter RecorderFactory) Option {
 	return func(o *options) {
 		o.recorder = newWriter
 	}
 }
 
-func (o options) sequenceOrFirst() uint64 {
-	if o.sequence == 0 {
-		return 1
-	}
-	return o.sequence
-}
+// eventName is the kind of a recordEvent. A meet state line has none.
+type eventName string
 
-// withSequence numbers a Client's recording, and names the recording it
-// replaces (zero if none). The Hub uses it for the Clients it creates.
-func withSequence(sequence, replaces uint64) Option {
-	return func(o *options) {
-		o.sequence, o.replaces = sequence, replaces
-	}
-}
+const (
+	eventStart           eventName = "start"
+	eventDial            eventName = "dial"
+	eventHandshake       eventName = "handshake"
+	eventConnected       eventName = "connected"
+	eventText            eventName = "text"
+	eventClose           eventName = "close"
+	eventReadError       eventName = "read_error"
+	eventTimeout         eventName = "timeout"
+	eventBackoff         eventName = "backoff"
+	eventRejected        eventName = "rejected"
+	eventClosed          eventName = "closed"
+	eventReplaced        eventName = "replaced"
+	eventRecorderDropped eventName = "recorder_dropped"
+)
 
-// replace closes the Client for a Hub that is swapping it for another, so
-// its recording ends with replaced instead of closed.
-func (c *Client) replace() {
-	c.replaced.Store(true)
-	c.Close()
-}
-
-// finalEvent is the last event of the Client's recording.
-func (c *Client) finalEvent() string {
-	if c.replaced.Load() {
-		return "replaced"
-	}
-	return "closed"
-}
-
-// recordEvent is one line of a recording. Its existing fields are shared
-// with cmd/lc-tap; changes only add fields or events.
+// recordEvent is one line of a recording. Its fields are shared with
+// cmd/lc-tap; changes only add fields or events.
 type recordEvent struct {
-	Rx       string `json:"rx"`
-	Conn     uint64 `json:"conn"`
-	Event    string `json:"event,omitempty"`
-	Count    int64  `json:"count,omitempty"`    // recorder_dropped
-	MeetID   string `json:"meetId,omitempty"`   // start
-	Sequence uint64 `json:"sequence,omitempty"` // start
-	Replaces uint64 `json:"replaces,omitempty"` // start
+	Rx       string    `json:"rx"`
+	Conn     uint64    `json:"conn"`
+	Event    eventName `json:"event,omitempty"`
+	Count    int64     `json:"count,omitempty"`    // recorder_dropped
+	MeetID   string    `json:"meetId,omitempty"`   // start
+	Sequence uint64    `json:"sequence,omitempty"` // start
+	Replaces uint64    `json:"replaces,omitempty"` // start
 
 	// The shapes below are those of cmd/lc-tap
 	Status int             `json:"status,omitempty"` // handshake
@@ -99,46 +84,16 @@ type recordEvent struct {
 	WaitMs int64 `json:"waitMs,omitempty"` // backoff
 }
 
-// recordAt queues e as having happened at t.
-func (c *Client) recordAt(t time.Time, e recordEvent) {
-	if c.rec == nil {
-		return
-	}
-	e.Rx = formatRecordTime(t)
-	c.rec.record(e)
-}
-
-// recordNow queues e as having happened now.
-func (c *Client) recordNow(e recordEvent) {
-	c.recordAt(time.Now(), e)
-}
-
-// redact removes everything from s that must stay out of a recording: the
-// credentials, the connection URL and its host. Errors from the network
-// name the address they failed to reach.
-func (c *Client) redact(s string) string {
-	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.MeetID + ":" + c.cfg.Password))
-	secrets := []string{c.cfg.Password, c.cfg.APIKey, auth, url.QueryEscape(auth), c.cfg.BaseURL}
-	if u, err := url.Parse(c.cfg.BaseURL); err == nil && u.Host != "" {
-		secrets = append(secrets, u.Host, u.Hostname())
-	}
-	// Longest first, so the URL goes before the host inside it
-	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
-	for _, secret := range secrets {
-		if len(secret) >= 4 {
-			s = strings.ReplaceAll(s, secret, "REDACTED")
-		}
-	}
-	return s
-}
-
 // recorder writes a Client's events to its recording on its own goroutine,
 // so a slow or failing writer cannot hold up the Client. A nil *recorder
 // records nothing.
 type recorder struct {
 	events  chan recordEvent
 	dropped atomic.Int64
-	once    sync.Once
+
+	// mu orders record against finish, which closes events
+	mu       sync.Mutex
+	finished bool
 }
 
 // newRecorder calls factory and starts writing the recording, beginning with
@@ -151,7 +106,7 @@ func newRecorder(factory RecorderFactory, info ClientInfo) (*recorder, error) {
 	r := &recorder{events: make(chan recordEvent, recorderBuffer)}
 	r.record(recordEvent{
 		Rx:       formatRecordTime(info.Start),
-		Event:    "start",
+		Event:    eventStart,
 		MeetID:   info.MeetID,
 		Sequence: info.Sequence,
 		Replaces: info.replaces,
@@ -164,10 +119,19 @@ func formatRecordTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
+func recordTimeNow() string {
+	return formatRecordTime(time.Now())
+}
+
 // record queues e without blocking, or counts it as dropped if the queue is
-// full. It must not be called after finish.
+// full. It does nothing after finish.
 func (r *recorder) record(e recordEvent) {
 	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
 		return
 	}
 	select {
@@ -177,16 +141,30 @@ func (r *recorder) record(e recordEvent) {
 	}
 }
 
-// finish queues the final event, then lets the writer drain and close the
-// recording. It does not wait for the writer.
-func (r *recorder) finish(final string) {
+// finish ends the recording with the final event, which is never dropped:
+// if the queue is full it waits for room on its own goroutine, so finish
+// does not wait for the writer. The writer then drains and closes the
+// recording.
+func (r *recorder) finish(final eventName) {
 	if r == nil {
 		return
 	}
-	r.once.Do(func() {
-		r.record(recordEvent{Rx: formatRecordTime(time.Now()), Event: final})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	e := recordEvent{Rx: recordTimeNow(), Event: final}
+	select {
+	case r.events <- e:
 		close(r.events)
-	})
+	default:
+		go func() {
+			r.events <- e
+			close(r.events)
+		}()
+	}
 }
 
 // write is the recorder's goroutine: one Write call for each line. Events
@@ -204,7 +182,7 @@ func (r *recorder) write(w io.WriteCloser) {
 	}
 	flushDropped := func() {
 		if n := r.dropped.Swap(0); n > 0 {
-			e := recordEvent{Rx: formatRecordTime(time.Now()), Event: "recorder_dropped", Count: n}
+			e := recordEvent{Rx: recordTimeNow(), Event: eventRecorderDropped, Count: n}
 			if !writeLine(e) {
 				r.dropped.Add(n)
 			}

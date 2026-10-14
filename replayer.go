@@ -2,6 +2,7 @@ package liftingcast
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,7 +69,7 @@ func (p *Replayer) decode(line []byte, last bool) (u Update, ok bool, err error)
 	if err := json.Unmarshal(line, &e); err != nil {
 		// Only blank lines and the last line, if the crash cut it short
 		// (it has no newline), are not errors
-		if last || len(trimSpace(line)) == 0 {
+		if last || len(bytes.TrimSpace(line)) == 0 {
 			return Update{}, false, nil
 		}
 		return Update{}, false, fmt.Errorf("liftingcast: replay line %d: %w", p.line, err)
@@ -82,16 +83,11 @@ func (p *Replayer) decode(line []byte, last bool) (u Update, ok bool, err error)
 	}
 	var at time.Time
 	if e.Rx != "" {
-		at, _ = time.Parse(time.RFC3339Nano, e.Rx)
+		if at, err = time.Parse(time.RFC3339Nano, e.Rx); err != nil {
+			return Update{}, false, fmt.Errorf("liftingcast: replay line %d: rx: %w", p.line, err)
+		}
 	}
 	return Update{State: state, Connection: e.Conn, ReceivedAt: at}, true, nil
-}
-
-func trimSpace(b []byte) []byte {
-	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\r' || b[0] == '\n') {
-		b = b[1:]
-	}
-	return b
 }
 
 // All returns an iterator over the rest of the recording's meet states. It

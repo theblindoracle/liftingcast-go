@@ -24,8 +24,7 @@ type options struct {
 	maxBackoff time.Duration
 	recorder   RecorderFactory
 
-	// Set by a Hub for the recording of each Client it creates: the
-	// Client's Sequence, and the Sequence it replaces, if any
+	// Set by a Hub: the Client's recording Sequence, and the one it replaces
 	sequence uint64
 	replaces uint64
 }
@@ -61,4 +60,19 @@ func newOptions(opts []Option) options {
 		opt(&o)
 	}
 	return o
+}
+
+func (o options) sequenceOrFirst() uint64 {
+	if o.sequence == 0 {
+		return 1
+	}
+	return o.sequence
+}
+
+// withSequence numbers a Client's recording, and names the recording it
+// replaces (zero if none). The Hub uses it for the Clients it creates.
+func withSequence(sequence, replaces uint64) Option {
+	return func(o *options) {
+		o.sequence, o.replaces = sequence, replaces
+	}
 }

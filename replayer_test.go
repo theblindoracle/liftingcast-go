@@ -121,6 +121,16 @@ func TestReplayerReportsCorruptLineBeforeTheEnd(t *testing.T) {
 	}
 }
 
+func TestReplayerReportsUnparseableReceiveTimeWithLine(t *testing.T) {
+	r := NewReplayer(strings.NewReader(`{"rx":"2026-10-01T10:00:01Z","conn":1,"msg":{"name":"A"}}` + "\n" + `{"rx":"yesterday","conn":1,"msg":{"name":"B"}}` + "\n"))
+	if _, err := r.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Next(); err == nil || !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("Next error = %v, want one naming line 2", err)
+	}
+}
+
 func TestReplayerReplaysTestdataRecordings(t *testing.T) {
 	files, err := filepath.Glob("testdata/*.jsonl")
 	if err != nil || len(files) == 0 {
