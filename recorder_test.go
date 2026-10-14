@@ -6,10 +6,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // memRecording is an in-memory recording writer. failFirst makes the first
@@ -80,7 +83,11 @@ func (m *memRecording) events(t *testing.T) []map[string]any {
 func eventNames(events []map[string]any) []string {
 	var names []string
 	for _, e := range events {
-		names = append(names, e["event"].(string))
+		name, _ := e["event"].(string)
+		if name == "" {
+			name = "meet" // meet-state lines have no event, as in lc-tap
+		}
+		names = append(names, name)
 	}
 	return names
 }
@@ -208,6 +215,289 @@ func TestRecorderFactoryErrorRunsWithoutRecording(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "bad path") {
 		t.Errorf("no warning logged: %s", logs.String())
+	}
+}
+
+// waitForEvent waits until the recording holds an event named name, and
+// returns the recording's events so far.
+func waitForEvent(t *testing.T, rec *memRecording, name string) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		events := rec.events(t)
+		for _, e := range events {
+			if e["event"] == name {
+				return events
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q event in %v", name, eventNames(events))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestRecorderRecordsConnectionAndMessagesInOrder(t *testing.T) {
+	srv := newFakeServer(t)
+	rec := newMemRecording()
+	c := NewClient(testConfig(srv.url), recorderOption(rec, nil))
+	c.pingInterval = 10 * time.Millisecond
+	c.Start()
+	server := srv.accept(t, time.Second)
+	// Answer the client's pings like LiftingCast does; none of it is recorded
+	var writeMu sync.Mutex
+	go func() {
+		for {
+			if _, _, err := server.ReadMessage(); err != nil {
+				return
+			}
+			writeMu.Lock()
+			server.WriteMessage(1, []byte("pong"))
+			writeMu.Unlock()
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	writeMu.Lock()
+	server.WriteMessage(1, []byte(`{"name":"Meet"}`))
+	server.WriteMessage(1, []byte(`Error: something odd`))
+	writeMu.Unlock()
+	<-c.Messages()
+	waitForEvent(t, rec, "text")
+	c.Close()
+	rec.waitClosed(t)
+
+	events := rec.events(t)
+	want := []string{"start", "dial", "handshake", "connected", "meet", "text", "closed"}
+	var got []string
+	for _, e := range events {
+		name, _ := e["event"].(string)
+		if name == "" {
+			name = "meet"
+		}
+		got = append(got, name)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for _, i := range []int{1, 2, 3, 4, 5} {
+		if events[i]["conn"] != float64(1) {
+			t.Errorf("%s conn = %v, want 1", got[i], events[i]["conn"])
+		}
+	}
+	if events[2]["status"] != float64(101) {
+		t.Errorf("handshake status = %v, want 101", events[2]["status"])
+	}
+	meet := events[4]
+	if meet["bytes"] != float64(15) || meet["rx"] == "" {
+		t.Errorf("meet message = %v", meet)
+	}
+	if m, _ := meet["msg"].(map[string]any); m["name"] != "Meet" {
+		t.Errorf("meet msg = %v", meet["msg"])
+	}
+	if text := events[5]; text["text"] != "Error: something odd" || text["bytes"] != float64(20) {
+		t.Errorf("text = %v", text)
+	}
+}
+
+// eventsUntil starts c and returns the recording's event names, with each
+// event as decoded, once an event named name has been written.
+func eventsUntil(t *testing.T, rec *memRecording, name string) ([]string, []map[string]any) {
+	t.Helper()
+	events := waitForEvent(t, rec, name)
+	return eventNames(events), events
+}
+
+func startRecorded(t *testing.T, url string) (*Client, *memRecording) {
+	t.Helper()
+	rec := newMemRecording()
+	c := NewClient(testConfig(url), recorderOption(rec, nil))
+	c.initialBackoff = 10 * time.Millisecond
+	t.Cleanup(c.Close)
+	c.Start()
+	return c, rec
+}
+
+func wantNames(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) < len(want) || strings.Join(got[:len(want)], ",") != strings.Join(want, ",") {
+		t.Fatalf("events = %v, want to begin %v", got, want)
+	}
+}
+
+func TestRecorderRecordsRefusedHandshakeAndBackoff(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.refuse.Store(http.StatusServiceUnavailable)
+	_, rec := startRecorded(t, srv.url)
+	names, events := eventsUntil(t, rec, "backoff")
+	wantNames(t, names, "start", "dial", "handshake", "backoff")
+	hs := events[2]
+	if hs["status"] != float64(503) || hs["conn"] != float64(1) || !strings.Contains(hs["body"].(string), "Service Unavailable") || hs["error"] == "" {
+		t.Errorf("handshake = %v", hs)
+	}
+	if events[3]["waitMs"] != float64(10) {
+		t.Errorf("backoff = %v, want waitMs 10", events[3])
+	}
+	// Still failing to connect: the next attempt is the same connection number
+	waitForEvent(t, rec, "dial")
+}
+
+func TestRecorderRecordsRejectedHandshake(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.refuse.Store(http.StatusUnauthorized)
+	_, rec := startRecorded(t, srv.url)
+	names, events := eventsUntil(t, rec, "rejected")
+	wantNames(t, names, "start", "dial", "handshake", "rejected")
+	if events[2]["status"] != float64(401) {
+		t.Errorf("handshake = %v", events[2])
+	}
+	if !strings.Contains(events[3]["error"].(string), "401") {
+		t.Errorf("rejected = %v", events[3])
+	}
+}
+
+func TestRecorderRecordsServerErrorThenDropThenReconnect(t *testing.T) {
+	srv := newFakeServer(t)
+	_, rec := startRecorded(t, srv.url)
+	server := srv.accept(t, time.Second)
+	server.WriteMessage(1, []byte("Error: try later"))
+	server.UnderlyingConn().Close()
+	srv.accept(t, time.Second)
+	names, events := eventsUntil(t, rec, "connected")
+	for len(events) < 9 { // wait for the second connected
+		time.Sleep(5 * time.Millisecond)
+		names, events = eventsUntil(t, rec, "connected")
+	}
+	wantNames(t, names, "start", "dial", "handshake", "connected", "text", "read_error", "backoff", "dial", "handshake", "connected")
+	if events[5]["conn"] != float64(1) || events[5]["error"] == "" {
+		t.Errorf("read_error = %v", events[5])
+	}
+	if events[6]["conn"] != float64(1) {
+		t.Errorf("backoff = %v, want conn 1", events[6])
+	}
+	if events[9]["conn"] != float64(2) {
+		t.Errorf("connected = %v, want conn 2", events[9])
+	}
+}
+
+func TestRecorderRecordsCloseFrame(t *testing.T) {
+	srv := newFakeServer(t)
+	_, rec := startRecorded(t, srv.url)
+	server := srv.accept(t, time.Second)
+	server.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "bye"))
+	names, events := eventsUntil(t, rec, "close")
+	wantNames(t, names, "start", "dial", "handshake", "connected", "close", "backoff")
+	if events[4]["code"] != float64(1001) || events[4]["text"] != "bye" {
+		t.Errorf("close = %v", events[4])
+	}
+}
+
+func TestRecorderRecordsTimeout(t *testing.T) {
+	srv := newFakeServer(t)
+	rec := newMemRecording()
+	c := NewClient(testConfig(srv.url), recorderOption(rec, nil))
+	c.messageTimeout = 50 * time.Millisecond
+	c.initialBackoff = 10 * time.Millisecond
+	t.Cleanup(c.Close)
+	c.Start()
+	srv.accept(t, time.Second)
+	names, events := eventsUntil(t, rec, "timeout")
+	wantNames(t, names, "start", "dial", "handshake", "connected", "timeout")
+	if events[4]["conn"] != float64(1) {
+		t.Errorf("timeout = %v", events[4])
+	}
+	// Our own close of the silent connection is not a read error
+	waitForEvent(t, rec, "backoff")
+	for _, n := range eventNames(rec.events(t)) {
+		if n == "read_error" {
+			t.Errorf("read_error recorded after a timeout")
+		}
+	}
+}
+
+func TestRecorderRecordsPermanentServerErrorAsRejected(t *testing.T) {
+	srv := newFakeServer(t)
+	_, rec := startRecorded(t, srv.url)
+	server := srv.accept(t, time.Second)
+	server.WriteMessage(1, []byte("Error: invalid api key"))
+	names, events := eventsUntil(t, rec, "rejected")
+	wantNames(t, names, "start", "dial", "handshake", "connected", "text", "rejected")
+	if events[5]["conn"] != float64(1) || !strings.Contains(events[5]["error"].(string), "invalid api key") {
+		t.Errorf("rejected = %v", events[5])
+	}
+}
+
+func TestRecorderDialFailureLeavesNoAddressOrCredentials(t *testing.T) {
+	cfg := Config{BaseURL: "ws://127.0.0.1:1/websocket", MeetID: "meet", Password: "hunter2-secret", APIKey: "api-key-secret"}
+	rec := newMemRecording()
+	c := NewClient(cfg, recorderOption(rec, nil))
+	t.Cleanup(c.Close)
+	c.Start()
+	_, events := eventsUntil(t, rec, "handshake")
+	if events[2]["error"] == "" || events[2]["status"] != nil {
+		t.Errorf("handshake = %v, want an error and no status", events[2])
+	}
+	c.Close()
+	rec.waitClosed(t)
+	out := rec.buf.String()
+	for _, secret := range []string{cfg.Password, cfg.APIKey, cfg.BaseURL, "127.0.0.1"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("recording contains %q: %s", secret, out)
+		}
+	}
+}
+
+func TestOverflowingRecorderDropsEventsAndCountsThem(t *testing.T) {
+	const messages = 200
+	srv := newFakeServer(t)
+	rec := newMemRecording()
+	rec.block = make(chan struct{})
+	c := NewClient(testConfig(srv.url), recorderOption(rec, nil))
+	t.Cleanup(c.Close)
+	c.Start()
+	server := srv.accept(t, time.Second)
+	go func() {
+		for i := 0; i < messages; i++ {
+			if server.WriteMessage(1, []byte(`{"name":"Meet"}`)) != nil {
+				return
+			}
+		}
+	}()
+	// The live connection delivers every message while the recording is stuck
+	for i := 0; i < messages; i++ {
+		select {
+		case <-c.Messages():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d messages delivered", i, messages)
+		}
+	}
+	c.Close()
+	close(rec.block)
+	rec.waitClosed(t)
+
+	// start, dial, handshake, connected, every message, and closed
+	const attempted = 4 + messages + 1
+	events := rec.events(t)
+	var written, dropped int
+	for _, e := range events {
+		if e["event"] == "recorder_dropped" {
+			dropped += int(e["count"].(float64))
+		} else {
+			written++
+		}
+	}
+	if dropped == 0 {
+		t.Fatalf("no events reported dropped, though %d were attempted into a queue of %d", attempted, recorderBuffer)
+	}
+	if written+dropped != attempted {
+		t.Errorf("written %d + dropped %d = %d, want %d", written, dropped, written+dropped, attempted)
+	}
+	// The queue, the one event the stuck writer holds, and the closed event,
+	// which may find room once the writer is released
+	if written > recorderBuffer+2 {
+		t.Errorf("wrote %d events from a stalled writer, more than the queue of %d plus two", written, recorderBuffer)
+	}
+	if events[0]["event"] != "start" {
+		t.Errorf("first event = %v, want start", events[0])
 	}
 }
 

@@ -1,8 +1,12 @@
 package liftingcast
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,6 +86,50 @@ type recordEvent struct {
 	MeetID   string `json:"meetId,omitempty"`   // start
 	Sequence uint64 `json:"sequence,omitempty"` // start
 	Replaces uint64 `json:"replaces,omitempty"` // start
+
+	// The shapes below are those of cmd/lc-tap
+	Status int             `json:"status,omitempty"` // handshake
+	Code   int             `json:"code,omitempty"`   // close
+	Bytes  int             `json:"bytes,omitempty"`  // meet state, text
+	Msg    json.RawMessage `json:"msg,omitempty"`    // meet state
+	Text   string          `json:"text,omitempty"`   // text, close
+	Error  string          `json:"error,omitempty"`  // handshake, read_error, rejected
+	Body   string          `json:"body,omitempty"`   // handshake
+
+	WaitMs int64 `json:"waitMs,omitempty"` // backoff
+}
+
+// recordAt queues e as having happened at t.
+func (c *Client) recordAt(t time.Time, e recordEvent) {
+	if c.rec == nil {
+		return
+	}
+	e.Rx = formatRecordTime(t)
+	c.rec.record(e)
+}
+
+// recordNow queues e as having happened now.
+func (c *Client) recordNow(e recordEvent) {
+	c.recordAt(time.Now(), e)
+}
+
+// redact removes everything from s that must stay out of a recording: the
+// credentials, the connection URL and its host. Errors from the network
+// name the address they failed to reach.
+func (c *Client) redact(s string) string {
+	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.MeetID + ":" + c.cfg.Password))
+	secrets := []string{c.cfg.Password, c.cfg.APIKey, auth, url.QueryEscape(auth), c.cfg.BaseURL}
+	if u, err := url.Parse(c.cfg.BaseURL); err == nil && u.Host != "" {
+		secrets = append(secrets, u.Host, u.Hostname())
+	}
+	// Longest first, so the URL goes before the host inside it
+	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+	for _, secret := range secrets {
+		if len(secret) >= 4 {
+			s = strings.ReplaceAll(s, secret, "REDACTED")
+		}
+	}
+	return s
 }
 
 // recorder writes a Client's events to its recording on its own goroutine,
