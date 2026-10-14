@@ -97,6 +97,25 @@ for u, err := range liftingcast.NewReplayer(f).All() {
 
 `Next` does the same one state at a time and returns `io.EOF` at the end. A last line cut short by a crash is skipped, and a recording with no final event is not an error. Any other malformed line is an error that names the line. Only meet states are replayed; the other events stay in the file for reading. The recordings in `testdata/` replay too, so a recording from a real incident can become a regression test.
 
+A `ReplaySource` plays a recording back to listeners at the pace it was recorded, for running consumers such as overlays against a past meet. `Speed` 1 is real time, 2 is twice as fast, and 0 is as fast as possible. `Loop` starts the recording again, from an empty meet state, when it ends:
+
+```go
+f, err := os.Open("rec-abc123-1.jsonl")
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+
+src := liftingcast.NewReplaySource(f, liftingcast.ReplayOptions{Speed: 1, Loop: true})
+defer src.Close()
+
+src.Listen(func(u liftingcast.Update) {
+	// the same Updates a Hub's listener gets, paced by the recorded receive times
+})
+```
+
+The replay starts at the first `Listen`. Its `Status` is always connected, for the meet `"replay"`, because a recording holds meet states and no meet ID. `*Hub` and `*ReplaySource` both satisfy `liftingcast.Source` (`Listen` and `Status`), so a consumer that accepts a `Source` works live and from a recording.
+
 ## Releasing
 
 Label the PR before merging it: `release:minor` (v0.3.0 → v0.4.0) or `release:patch` (v0.3.0 → v0.3.1). Once CI passes on `main`, it puts the next annotated `vX.Y.Z` tag on the merge commit. A PR with neither label releases nothing; a PR with both fails the release job. To see the version a label would give, without tagging anything:
