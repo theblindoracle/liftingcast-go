@@ -61,6 +61,42 @@ A `Client` waits 2s before its first reconnect attempt, doubling each time up to
 
 The API is unstable until v1.
 
+## Recording and replay
+
+`WithRecorder` writes a recording of each upstream connection: everything LiftingCast sent on it, and how each connection began and ended (dials, handshakes, server errors, closes, timeouts, backoffs, rejections). It works on `NewHub` and `NewClient`. The option is a factory, called once for each `Client` created, so a new meet or new credentials gets a new recording:
+
+```go
+hub := liftingcast.NewHub(liftingcast.WithRecorder(
+	func(info liftingcast.ClientInfo) (io.WriteCloser, error) {
+		name := fmt.Sprintf("rec-%s-%d.jsonl", info.MeetID, info.Sequence)
+		return os.Create(name)
+	},
+))
+```
+
+Recordings are JSONL, one event per line, and never contain credentials or the connection URL. Pings and pongs are left out. A recording ends with `closed`, or `replaced` if the Hub replaced the connection; the next recording's `start` names the one it replaced. The library closes the writer after the last event and does not rotate, compress or keep files, so wrap the writer yourself for that. Pass an unbuffered writer such as an `*os.File`, or flush your own buffering after it is closed.
+
+Recording never affects the live feed. Events go onto a buffered queue and are written by a separate goroutine, so a slow or failing writer drops events instead of stalling the connection. The recording then holds a `recorder_dropped` event with a count. A factory error is logged and that connection runs without a recording. A full-day meet can reach hundreds of MB, because every message carries every lifter.
+
+A `Replayer` feeds a recording back through a `Cache`, giving the same meet states, with the same connection numbers and receive times, that listeners were given at the time:
+
+```go
+f, err := os.Open("rec-abc123-1.jsonl")
+if err != nil {
+	log.Fatal(err)
+}
+defer f.Close()
+
+for u, err := range liftingcast.NewReplayer(f).All() {
+	if err != nil {
+		log.Fatal(err)
+	}
+	// u.State, u.Connection and u.ReceivedAt are what a listener saw
+}
+```
+
+`Next` does the same one state at a time and returns `io.EOF` at the end. A last line cut short by a crash is skipped, and a recording with no final event is not an error. Any other malformed line is an error that names the line. Only meet states are replayed; the other events stay in the file for reading. The recordings in `testdata/` replay too, so a recording from a real incident can become a regression test.
+
 ## Releasing
 
 Label the PR before merging it: `release:minor` (v0.3.0 → v0.4.0) or `release:patch` (v0.3.0 → v0.3.1). Once CI passes on `main`, it puts the next annotated `vX.Y.Z` tag on the merge commit. A PR with neither label releases nothing; a PR with both fails the release job. To see the version a label would give, without tagging anything:

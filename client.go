@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -34,6 +38,9 @@ const (
 
 	// Write deadline for sending messages
 	writeWait = 10 * time.Second
+
+	// Most of a refused handshake's body that a recording keeps
+	maxRecordedBody = 4096
 )
 
 // errClientClosed is returned by dial after Close has been called.
@@ -121,6 +128,13 @@ type Client struct {
 	// LiftingCast accepted, only used by run
 	backoff    time.Duration
 	connection uint64
+
+	// This Client's recording, nil if there is none
+	rec *recorder
+
+	// Set before Close when a Hub replaces this Client, so its recording
+	// ends with replaced rather than closed
+	replaced atomic.Bool
 }
 
 // NewClient creates a LiftingCast WebSocket client for the meet and
@@ -128,9 +142,10 @@ type Client struct {
 // reconnect backoff is capped at 5s unless opts include WithMaxBackoff.
 func NewClient(cfg Config, opts ...Option) *Client {
 	o := newOptions(opts)
-	return &Client{
+	log := o.logger.With("meetID", cfg.MeetID)
+	c := &Client{
 		cfg:              cfg,
-		log:              o.logger.With("meetID", cfg.MeetID),
+		log:              log,
 		messages:         make(chan Message, 10),
 		stop:             make(chan struct{}),
 		pingInterval:     pingInterval,
@@ -139,6 +154,16 @@ func NewClient(cfg Config, opts ...Option) *Client {
 		maxBackoff:       o.maxBackoff,
 		handshakeTimeout: handshakeTimeout,
 	}
+	if o.recorder != nil {
+		info := ClientInfo{MeetID: cfg.MeetID, Sequence: o.sequenceOrFirst(), Start: time.Now(), replaces: o.replaces}
+		rec, err := newRecorder(o.recorder, info)
+		if err != nil {
+			log.Warn("failed to create recording, running without one", "err", err)
+		} else {
+			c.rec = rec
+		}
+	}
+	return c
 }
 
 // Start begins connecting, and keeps the client connected until Close. It
@@ -157,17 +182,22 @@ func (c *Client) Start() {
 // before dialling again, until Close. Once rejected it stops dialling and
 // waits for Close.
 func (c *Client) run() {
+	defer func() { c.rec.finish(c.finalEvent()) }()
 	defer close(c.messages)
 	c.resetBackoff()
 	for {
-		conn, err := c.dial()
+		// Every event of this attempt carries its number, which becomes
+		// the connection's if LiftingCast accepts it
+		attempt := c.connection + 1
+		conn, err := c.dial(attempt)
 		if errors.Is(err, errClientClosed) {
 			return
 		}
 		if err != nil {
 			c.log.Warn("failed to connect to LiftingCast", "err", err)
 		} else {
-			c.connection++
+			c.connection = attempt
+			c.recordNow(recordEvent{Conn: attempt, Event: eventConnected})
 			c.setStatus(ClientStatus{Connected: true})
 			var resetBackoff bool
 			resetBackoff, err = c.serve(conn, c.connection)
@@ -184,12 +214,14 @@ func (c *Client) run() {
 			c.log.Warn("LiftingCast connection dropped", "err", err)
 		}
 		if isRejected(err) {
+			c.recordNow(recordEvent{Conn: attempt, Event: eventRejected, Error: c.redact(err.Error())})
 			c.setStatus(ClientStatus{Rejected: true, LastError: err.Error()})
 			<-c.stop
 			return
 		}
 		c.setStatus(ClientStatus{LastError: err.Error()})
 
+		c.recordNow(recordEvent{Conn: attempt, Event: eventBackoff, WaitMs: c.backoff.Milliseconds()})
 		c.log.Info("reconnecting to LiftingCast", "after", c.backoff)
 		select {
 		case <-time.After(c.backoff):
@@ -208,7 +240,7 @@ func (c *Client) resetBackoff() {
 
 // dial makes one attempt to open a new connection and make it the current
 // one. Close abandons a pending dial.
-func (c *Client) dial() (*websocket.Conn, error) {
+func (c *Client) dial(attempt uint64) (*websocket.Conn, error) {
 	// Build WebSocket URL with query parameters
 	wsURL, err := c.buildURL()
 	if err != nil {
@@ -256,16 +288,26 @@ func (c *Client) dial() (*websocket.Conn, error) {
 			return conn, nil
 		},
 	}
+	c.recordNow(recordEvent{Conn: attempt, Event: eventDial})
 	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		if c.stopped() {
 			return nil, errClientClosed
 		}
+		e := recordEvent{Conn: attempt, Event: eventHandshake, Error: c.redact(err.Error())}
+		if resp != nil {
+			e.Status = resp.StatusCode
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRecordedBody))
+			resp.Body.Close()
+			e.Body = c.redact(string(body))
+		}
+		c.recordNow(e)
 		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			return nil, rejectedError{fmt.Errorf("handshake refused: %s", resp.Status)}
 		}
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
+	c.recordNow(recordEvent{Conn: attempt, Event: eventHandshake, Status: resp.StatusCode})
 	c.log.Info("connected to LiftingCast")
 
 	c.mu.Lock()
@@ -318,7 +360,7 @@ func (c *Client) serve(conn *websocket.Conn, connection uint64) (resetBackoff bo
 	}()
 	go func() {
 		defer wg.Done()
-		timedOut = c.timeoutMonitor(conn, done, heartbeat)
+		timedOut = c.timeoutMonitor(conn, connection, done, heartbeat)
 	}()
 
 	var gotMeetState bool
@@ -330,6 +372,12 @@ func (c *Client) serve(conn *websocket.Conn, connection uint64) (resetBackoff bo
 			conn.Close()
 			close(done)
 			wg.Wait()
+			// Our own close of the connection, for Close, a timeout or a
+			// rejection, is not worth recording: the closed, timeout or
+			// rejected event says why
+			if !c.stopped() && !timedOut && !isRejected(serverErr) {
+				c.recordReadError(connection, receivedAt, err)
+			}
 
 			resetBackoff := gotMeetState && serverErr == nil
 			switch {
@@ -360,6 +408,19 @@ func (c *Client) serve(conn *websocket.Conn, connection uint64) (resetBackoff bo
 	}
 }
 
+// recordReadError records why reading connection failed: the close frame
+// the server sent, or else the error.
+func (c *Client) recordReadError(connection uint64, at time.Time, err error) {
+	// gorilla reports a connection that ends without a close frame as code
+	// 1006, which no server sends
+	var ce *websocket.CloseError
+	if errors.As(err, &ce) && ce.Code != websocket.CloseAbnormalClosure {
+		c.recordAt(at, recordEvent{Conn: connection, Event: eventClose, Code: ce.Code, Text: ce.Text})
+		return
+	}
+	c.recordAt(at, recordEvent{Conn: connection, Event: eventReadError, Error: c.redact(err.Error())})
+}
+
 // handleMessage processes received messages. It reports whether msg was
 // meet state, or returns the server error if it was one, as a rejectedError
 // if it is known to be permanent.
@@ -383,6 +444,7 @@ func (c *Client) handleMessage(msg Message, heartbeat chan<- struct{}) (meetStat
 	}
 	if err != nil {
 		// Not meet-state JSON - treat as error message
+		c.recordAt(msg.ReceivedAt, recordEvent{Conn: msg.Connection, Event: eventText, Bytes: len(message), Text: msgStr})
 		c.log.Warn("LiftingCast sent a server error", "message", msgStr)
 		err = fmt.Errorf("server error: %s", msgStr)
 		if permanentServerErrors[msgStr] {
@@ -393,6 +455,7 @@ func (c *Client) handleMessage(msg Message, heartbeat chan<- struct{}) (meetStat
 	}
 
 	// Valid meet state
+	c.recordAt(msg.ReceivedAt, recordEvent{Conn: msg.Connection, Bytes: len(message), Msg: message})
 	select {
 	case c.messages <- msg:
 	case <-c.stop:
@@ -432,7 +495,7 @@ func sendPing(conn *websocket.Conn) error {
 // timeoutMonitor closes one connection if nothing arrives on it for
 // messageTimeout, and reports whether it did. Closing it makes serve's read
 // fail.
-func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, heartbeat <-chan struct{}) bool {
+func (c *Client) timeoutMonitor(conn *websocket.Conn, connection uint64, done <-chan struct{}, heartbeat <-chan struct{}) bool {
 	timer := time.NewTimer(c.messageTimeout)
 	defer timer.Stop()
 
@@ -441,6 +504,7 @@ func (c *Client) timeoutMonitor(conn *websocket.Conn, done <-chan struct{}, hear
 		case <-heartbeat:
 			timer.Reset(c.messageTimeout)
 		case <-timer.C:
+			c.recordNow(recordEvent{Conn: connection, Event: eventTimeout})
 			c.log.Warn("LiftingCast connection timed out", "after", c.messageTimeout)
 			conn.Close()
 			return true
@@ -512,5 +576,54 @@ func (c *Client) Close() {
 	}
 	if !c.started {
 		close(c.messages)
+		c.rec.finish(c.finalEvent())
 	}
+}
+
+// replace closes the Client for a Hub that is swapping it for another, so
+// its recording ends with replaced instead of closed.
+func (c *Client) replace() {
+	c.replaced.Store(true)
+	c.Close()
+}
+
+// finalEvent is the last event of the Client's recording.
+func (c *Client) finalEvent() eventName {
+	if c.replaced.Load() {
+		return eventReplaced
+	}
+	return eventClosed
+}
+
+// recordAt queues e as having happened at t.
+func (c *Client) recordAt(t time.Time, e recordEvent) {
+	if c.rec == nil {
+		return
+	}
+	e.Rx = formatRecordTime(t)
+	c.rec.record(e)
+}
+
+// recordNow queues e as having happened now.
+func (c *Client) recordNow(e recordEvent) {
+	c.recordAt(time.Now(), e)
+}
+
+// redact removes the credentials, the connection URL and its host from s,
+// which must stay out of a recording. Network errors name the address they
+// failed to reach.
+func (c *Client) redact(s string) string {
+	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.MeetID + ":" + c.cfg.Password))
+	secrets := []string{c.cfg.Password, c.cfg.APIKey, auth, url.QueryEscape(auth), c.cfg.BaseURL}
+	if u, err := url.Parse(c.cfg.BaseURL); err == nil && u.Host != "" {
+		secrets = append(secrets, u.Host, u.Hostname())
+	}
+	// Longest first, so the URL goes before the host inside it
+	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+	for _, secret := range secrets {
+		if len(secret) >= 4 {
+			s = strings.ReplaceAll(s, secret, "REDACTED")
+		}
+	}
+	return s
 }
