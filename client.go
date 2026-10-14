@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -184,15 +186,18 @@ func (c *Client) run() {
 	defer close(c.messages)
 	c.resetBackoff()
 	for {
-		conn, err := c.dial()
+		// Every event of this attempt carries its number, which becomes
+		// the connection's if LiftingCast accepts it
+		attempt := c.connection + 1
+		conn, err := c.dial(attempt)
 		if errors.Is(err, errClientClosed) {
 			return
 		}
 		if err != nil {
 			c.log.Warn("failed to connect to LiftingCast", "err", err)
 		} else {
-			c.connection++
-			c.recordNow(recordEvent{Conn: c.connection, Event: "connected"})
+			c.connection = attempt
+			c.recordNow(recordEvent{Conn: attempt, Event: eventConnected})
 			c.setStatus(ClientStatus{Connected: true})
 			var resetBackoff bool
 			resetBackoff, err = c.serve(conn, c.connection)
@@ -209,14 +214,14 @@ func (c *Client) run() {
 			c.log.Warn("LiftingCast connection dropped", "err", err)
 		}
 		if isRejected(err) {
-			c.recordNow(recordEvent{Conn: c.connection, Event: "rejected", Error: c.redact(err.Error())})
+			c.recordNow(recordEvent{Conn: attempt, Event: eventRejected, Error: c.redact(err.Error())})
 			c.setStatus(ClientStatus{Rejected: true, LastError: err.Error()})
 			<-c.stop
 			return
 		}
 		c.setStatus(ClientStatus{LastError: err.Error()})
 
-		c.recordNow(recordEvent{Conn: c.connection, Event: "backoff", WaitMs: c.backoff.Milliseconds()})
+		c.recordNow(recordEvent{Conn: attempt, Event: eventBackoff, WaitMs: c.backoff.Milliseconds()})
 		c.log.Info("reconnecting to LiftingCast", "after", c.backoff)
 		select {
 		case <-time.After(c.backoff):
@@ -235,7 +240,7 @@ func (c *Client) resetBackoff() {
 
 // dial makes one attempt to open a new connection and make it the current
 // one. Close abandons a pending dial.
-func (c *Client) dial() (*websocket.Conn, error) {
+func (c *Client) dial(attempt uint64) (*websocket.Conn, error) {
 	// Build WebSocket URL with query parameters
 	wsURL, err := c.buildURL()
 	if err != nil {
@@ -283,15 +288,13 @@ func (c *Client) dial() (*websocket.Conn, error) {
 			return conn, nil
 		},
 	}
-	// A dial that is accepted becomes the next connection
-	next := c.connection + 1
-	c.recordNow(recordEvent{Conn: next, Event: "dial"})
+	c.recordNow(recordEvent{Conn: attempt, Event: eventDial})
 	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		if c.stopped() {
 			return nil, errClientClosed
 		}
-		e := recordEvent{Conn: next, Event: "handshake", Error: c.redact(err.Error())}
+		e := recordEvent{Conn: attempt, Event: eventHandshake, Error: c.redact(err.Error())}
 		if resp != nil {
 			e.Status = resp.StatusCode
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxRecordedBody))
@@ -304,7 +307,7 @@ func (c *Client) dial() (*websocket.Conn, error) {
 		}
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
-	c.recordNow(recordEvent{Conn: next, Event: "handshake", Status: resp.StatusCode})
+	c.recordNow(recordEvent{Conn: attempt, Event: eventHandshake, Status: resp.StatusCode})
 	c.log.Info("connected to LiftingCast")
 
 	c.mu.Lock()
@@ -412,10 +415,10 @@ func (c *Client) recordReadError(connection uint64, at time.Time, err error) {
 	// 1006, which no server sends
 	var ce *websocket.CloseError
 	if errors.As(err, &ce) && ce.Code != websocket.CloseAbnormalClosure {
-		c.recordAt(at, recordEvent{Conn: connection, Event: "close", Code: ce.Code, Text: ce.Text})
+		c.recordAt(at, recordEvent{Conn: connection, Event: eventClose, Code: ce.Code, Text: ce.Text})
 		return
 	}
-	c.recordAt(at, recordEvent{Conn: connection, Event: "read_error", Error: c.redact(err.Error())})
+	c.recordAt(at, recordEvent{Conn: connection, Event: eventReadError, Error: c.redact(err.Error())})
 }
 
 // handleMessage processes received messages. It reports whether msg was
@@ -441,7 +444,7 @@ func (c *Client) handleMessage(msg Message, heartbeat chan<- struct{}) (meetStat
 	}
 	if err != nil {
 		// Not meet-state JSON - treat as error message
-		c.recordAt(msg.ReceivedAt, recordEvent{Conn: msg.Connection, Event: "text", Bytes: len(message), Text: msgStr})
+		c.recordAt(msg.ReceivedAt, recordEvent{Conn: msg.Connection, Event: eventText, Bytes: len(message), Text: msgStr})
 		c.log.Warn("LiftingCast sent a server error", "message", msgStr)
 		err = fmt.Errorf("server error: %s", msgStr)
 		if permanentServerErrors[msgStr] {
@@ -501,7 +504,7 @@ func (c *Client) timeoutMonitor(conn *websocket.Conn, connection uint64, done <-
 		case <-heartbeat:
 			timer.Reset(c.messageTimeout)
 		case <-timer.C:
-			c.recordNow(recordEvent{Conn: connection, Event: "timeout"})
+			c.recordNow(recordEvent{Conn: connection, Event: eventTimeout})
 			c.log.Warn("LiftingCast connection timed out", "after", c.messageTimeout)
 			conn.Close()
 			return true
@@ -575,4 +578,52 @@ func (c *Client) Close() {
 		close(c.messages)
 		c.rec.finish(c.finalEvent())
 	}
+}
+
+// replace closes the Client for a Hub that is swapping it for another, so
+// its recording ends with replaced instead of closed.
+func (c *Client) replace() {
+	c.replaced.Store(true)
+	c.Close()
+}
+
+// finalEvent is the last event of the Client's recording.
+func (c *Client) finalEvent() eventName {
+	if c.replaced.Load() {
+		return eventReplaced
+	}
+	return eventClosed
+}
+
+// recordAt queues e as having happened at t.
+func (c *Client) recordAt(t time.Time, e recordEvent) {
+	if c.rec == nil {
+		return
+	}
+	e.Rx = formatRecordTime(t)
+	c.rec.record(e)
+}
+
+// recordNow queues e as having happened now.
+func (c *Client) recordNow(e recordEvent) {
+	c.recordAt(time.Now(), e)
+}
+
+// redact removes the credentials, the connection URL and its host from s,
+// which must stay out of a recording. Network errors name the address they
+// failed to reach.
+func (c *Client) redact(s string) string {
+	auth := base64.StdEncoding.EncodeToString([]byte(c.cfg.MeetID + ":" + c.cfg.Password))
+	secrets := []string{c.cfg.Password, c.cfg.APIKey, auth, url.QueryEscape(auth), c.cfg.BaseURL}
+	if u, err := url.Parse(c.cfg.BaseURL); err == nil && u.Host != "" {
+		secrets = append(secrets, u.Host, u.Hostname())
+	}
+	// Longest first, so the URL goes before the host inside it
+	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+	for _, secret := range secrets {
+		if len(secret) >= 4 {
+			s = strings.ReplaceAll(s, secret, "REDACTED")
+		}
+	}
+	return s
 }
