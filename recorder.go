@@ -26,6 +26,9 @@ type ClientInfo struct {
 	Sequence uint64
 	// Start is when the Client was created.
 	Start time.Time
+
+	// replaces is the Sequence of the recording this one replaced, or zero
+	replaces uint64
 }
 
 // RecorderFactory creates the writer for one Client's recording. The library
@@ -43,6 +46,36 @@ func WithRecorder(newWriter RecorderFactory) Option {
 	}
 }
 
+func (o options) sequenceOrFirst() uint64 {
+	if o.sequence == 0 {
+		return 1
+	}
+	return o.sequence
+}
+
+// withSequence numbers a Client's recording, and names the recording it
+// replaces (zero if none). The Hub uses it for the Clients it creates.
+func withSequence(sequence, replaces uint64) Option {
+	return func(o *options) {
+		o.sequence, o.replaces = sequence, replaces
+	}
+}
+
+// replace closes the Client for a Hub that is swapping it for another, so
+// its recording ends with replaced instead of closed.
+func (c *Client) replace() {
+	c.replaced.Store(true)
+	c.Close()
+}
+
+// finalEvent is the last event of the Client's recording.
+func (c *Client) finalEvent() string {
+	if c.replaced.Load() {
+		return "replaced"
+	}
+	return "closed"
+}
+
 // recordEvent is one line of a recording. Its existing fields are shared
 // with cmd/lc-tap; changes only add fields or events.
 type recordEvent struct {
@@ -52,6 +85,7 @@ type recordEvent struct {
 	Count    int64  `json:"count,omitempty"`    // recorder_dropped
 	MeetID   string `json:"meetId,omitempty"`   // start
 	Sequence uint64 `json:"sequence,omitempty"` // start
+	Replaces uint64 `json:"replaces,omitempty"` // start
 
 	// The shapes below are those of cmd/lc-tap
 	Status int             `json:"status,omitempty"` // handshake
@@ -120,6 +154,7 @@ func newRecorder(factory RecorderFactory, info ClientInfo) (*recorder, error) {
 		Event:    "start",
 		MeetID:   info.MeetID,
 		Sequence: info.Sequence,
+		Replaces: info.replaces,
 	})
 	go r.write(w)
 	return r, nil

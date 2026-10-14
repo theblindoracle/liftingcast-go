@@ -77,6 +77,10 @@ type Hub struct {
 	// only go up: connectionBase is added to them, and lastConnection is
 	// the highest the Hub has handed out. Only the loop uses them.
 	connectionBase uint64
+
+	// Number of the last Client's recording, for ClientInfo.Sequence. Only
+	// the loop uses it.
+	sequence       uint64
 	lastConnection uint64
 
 	// Carries Connect's and Disconnect's requests to the loop
@@ -110,9 +114,11 @@ type listenRequest struct {
 }
 
 // NewHub creates a hub with no upstream connection and starts its loop. Call
-// Connect to follow a meet, and Close when done with the hub. WithLogger and
-// WithMaxBackoff in opts are passed on to every Client it starts; without
-// WithMaxBackoff their reconnect backoff is capped at 5s.
+// Connect to follow a meet, and Close when done with the hub. WithLogger,
+// WithMaxBackoff and WithRecorder in opts are passed on to every Client it
+// starts; without WithMaxBackoff their reconnect backoff is capped at 5s.
+// Each Client gets its own recording, and a Client replaced by Connect ends
+// its recording with a replaced event, see WithRecorder.
 func NewHub(opts ...Option) *Hub {
 	hub := &Hub{
 		opts:      newOptions(opts),
@@ -289,9 +295,15 @@ func (h *Hub) Status() HubStatus {
 // none if cfg is nil
 func (h *Hub) handleConnect(cfg *Config) {
 	// Stop existing upstream connection if present
+	var replaces uint64
 	if h.upstreamClient != nil {
 		h.opts.logger.Info("stopping upstream connection", "meetID", h.meetID)
-		h.upstreamClient.Close()
+		if cfg != nil {
+			replaces = h.sequence
+			h.upstreamClient.replace()
+		} else {
+			h.upstreamClient.Close()
+		}
 		h.upstreamMu.Lock()
 		h.upstreamClient = nil
 		h.upstreamMu.Unlock()
@@ -314,7 +326,7 @@ func (h *Hub) handleConnect(cfg *Config) {
 		return
 	}
 
-	client := h.startClient(*cfg)
+	client := h.startClient(*cfg, replaces)
 	h.upstreamMu.Lock()
 	h.upstreamClient = client
 	h.meetID = cfg.MeetID
@@ -323,8 +335,13 @@ func (h *Hub) handleConnect(cfg *Config) {
 
 // startClient starts a new upstream connection and forwards its messages to
 // the loop until it is closed or the hub has closed.
-func (h *Hub) startClient(cfg Config) *Client {
-	client := NewClient(cfg, WithLogger(h.opts.logger), WithMaxBackoff(h.opts.maxBackoff))
+func (h *Hub) startClient(cfg Config, replaces uint64) *Client {
+	h.sequence++
+	opts := []Option{WithLogger(h.opts.logger), WithMaxBackoff(h.opts.maxBackoff), withSequence(h.sequence, replaces)}
+	if h.opts.recorder != nil {
+		opts = append(opts, WithRecorder(h.opts.recorder))
+	}
+	client := NewClient(cfg, opts...)
 	if h.tuneClient != nil {
 		h.tuneClient(client)
 	}
