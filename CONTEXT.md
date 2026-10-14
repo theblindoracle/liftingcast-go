@@ -46,3 +46,11 @@ _Avoid_: local, Docker
 **Listener**:
 An in-process consumer that receives every meet state in order, starting with the current meet state if there is one. It outlives any one upstream connection and stops only when its own stop is called or the Hub is closed; once stopped it is never called again.
 _Avoid_: subscriber, client
+
+**Recording**:
+The record of one upstream connection from when it starts until it is closed: everything LiftingCast sent on it, how each connection to LiftingCast began and ended, and what was done about it. Replacing an upstream connection ends its recording and starts a new one. A recording never contains credentials.
+_Avoid_: log, capture, trace
+
+**Replay**:
+Feeding a recording back through the meet state in order, so it produces the same meet states, with the same connection numbers and receive times, that listeners were given at the time.
+_Avoid_: playback, re-run
