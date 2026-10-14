@@ -23,6 +23,11 @@ type options struct {
 	logger     *slog.Logger
 	maxBackoff time.Duration
 	recorder   RecorderFactory
+
+	// Set by a Hub for the recording of each Client it creates: the
+	// Client's Sequence, and the Sequence it replaces, if any
+	sequence uint64
+	replaces uint64
 }
 
 // WithLogger sends the Client's or Hub's logs to logger. Without it they log
