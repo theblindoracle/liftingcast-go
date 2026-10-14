@@ -22,6 +22,7 @@ type Option func(*options)
 type options struct {
 	logger     *slog.Logger
 	maxBackoff time.Duration
+	recorder   RecorderFactory
 }
 
 // WithLogger sends the Client's or Hub's logs to logger. Without it they log

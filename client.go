@@ -121,6 +121,9 @@ type Client struct {
 	// LiftingCast accepted, only used by run
 	backoff    time.Duration
 	connection uint64
+
+	// This Client's recording, nil if there is none
+	rec *recorder
 }
 
 // NewClient creates a LiftingCast WebSocket client for the meet and
@@ -128,9 +131,10 @@ type Client struct {
 // reconnect backoff is capped at 5s unless opts include WithMaxBackoff.
 func NewClient(cfg Config, opts ...Option) *Client {
 	o := newOptions(opts)
-	return &Client{
+	log := o.logger.With("meetID", cfg.MeetID)
+	c := &Client{
 		cfg:              cfg,
-		log:              o.logger.With("meetID", cfg.MeetID),
+		log:              log,
 		messages:         make(chan Message, 10),
 		stop:             make(chan struct{}),
 		pingInterval:     pingInterval,
@@ -139,6 +143,16 @@ func NewClient(cfg Config, opts ...Option) *Client {
 		maxBackoff:       o.maxBackoff,
 		handshakeTimeout: handshakeTimeout,
 	}
+	if o.recorder != nil {
+		info := ClientInfo{MeetID: cfg.MeetID, Sequence: 1, Start: time.Now()}
+		rec, err := newRecorder(o.recorder, info)
+		if err != nil {
+			log.Warn("failed to create recording, running without one", "err", err)
+		} else {
+			c.rec = rec
+		}
+	}
+	return c
 }
 
 // Start begins connecting, and keeps the client connected until Close. It
@@ -157,6 +171,7 @@ func (c *Client) Start() {
 // before dialling again, until Close. Once rejected it stops dialling and
 // waits for Close.
 func (c *Client) run() {
+	defer c.rec.finish("closed")
 	defer close(c.messages)
 	c.resetBackoff()
 	for {
@@ -512,5 +527,6 @@ func (c *Client) Close() {
 	}
 	if !c.started {
 		close(c.messages)
+		c.rec.finish("closed")
 	}
 }
