@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -124,6 +125,10 @@ type Client struct {
 
 	// This Client's recording, nil if there is none
 	rec *recorder
+
+	// Set before Close when a Hub replaces this Client, so its recording
+	// ends with replaced rather than closed
+	replaced atomic.Bool
 }
 
 // NewClient creates a LiftingCast WebSocket client for the meet and
@@ -144,7 +149,7 @@ func NewClient(cfg Config, opts ...Option) *Client {
 		handshakeTimeout: handshakeTimeout,
 	}
 	if o.recorder != nil {
-		info := ClientInfo{MeetID: cfg.MeetID, Sequence: 1, Start: time.Now()}
+		info := ClientInfo{MeetID: cfg.MeetID, Sequence: o.sequenceOrFirst(), Start: time.Now(), replaces: o.replaces}
 		rec, err := newRecorder(o.recorder, info)
 		if err != nil {
 			log.Warn("failed to create recording, running without one", "err", err)
@@ -171,7 +176,7 @@ func (c *Client) Start() {
 // before dialling again, until Close. Once rejected it stops dialling and
 // waits for Close.
 func (c *Client) run() {
-	defer c.rec.finish("closed")
+	defer func() { c.rec.finish(c.finalEvent()) }()
 	defer close(c.messages)
 	c.resetBackoff()
 	for {
@@ -527,6 +532,6 @@ func (c *Client) Close() {
 	}
 	if !c.started {
 		close(c.messages)
-		c.rec.finish("closed")
+		c.rec.finish(c.finalEvent())
 	}
 }

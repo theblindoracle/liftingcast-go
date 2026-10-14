@@ -210,3 +210,79 @@ func TestRecorderFactoryErrorRunsWithoutRecording(t *testing.T) {
 		t.Errorf("no warning logged: %s", logs.String())
 	}
 }
+
+// recordingSet is a RecorderFactory's in-memory recordings, one per Client.
+type recordingSet struct {
+	mu   sync.Mutex
+	recs []*memRecording
+}
+
+func (s *recordingSet) option() Option {
+	return WithRecorder(func(ClientInfo) (io.WriteCloser, error) {
+		m := newMemRecording()
+		s.mu.Lock()
+		s.recs = append(s.recs, m)
+		s.mu.Unlock()
+		return m, nil
+	})
+}
+
+func (s *recordingSet) get(t *testing.T, i int) *memRecording {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.recs) <= i {
+		t.Fatalf("got %d recordings, want more than %d", len(s.recs), i)
+	}
+	return s.recs[i]
+}
+
+func (s *recordingSet) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.recs)
+}
+
+func TestHubRecordsEachClientAndMarksReplacement(t *testing.T) {
+	srv := newFakeServer(t)
+	set := &recordingSet{}
+	hub := NewHub(set.option())
+	t.Cleanup(hub.Close)
+
+	hub.Connect(Config{BaseURL: srv.url, MeetID: "a"})
+	srv.accept(t, time.Second)
+	hub.Connect(Config{BaseURL: srv.url, MeetID: "b"})
+	srv.accept(t, time.Second)
+
+	first, second := set.get(t, 0), set.get(t, 1)
+	first.waitClosed(t)
+	ev := first.events(t)
+	if last := ev[len(ev)-1]["event"]; last != "replaced" {
+		t.Errorf("old recording's last event = %v, want replaced", last)
+	}
+	if first.closedAt != first.buf.Len() {
+		t.Errorf("old writer was written to after Close")
+	}
+	if ev[0]["event"] != "start" || ev[0]["sequence"] != float64(1) || ev[0]["replaces"] != nil {
+		t.Errorf("first start = %v, want sequence 1 and no replaces", ev[0])
+	}
+	start := second.events(t)[0]
+	if start["event"] != "start" || start["meetId"] != "b" || start["sequence"] != float64(2) || start["replaces"] != float64(1) {
+		t.Errorf("second start = %v, want meet b, sequence 2, replaces 1", start)
+	}
+
+	hub.Disconnect()
+	second.waitClosed(t)
+	ev = second.events(t)
+	if last := ev[len(ev)-1]["event"]; last != "closed" {
+		t.Errorf("disconnected recording's last event = %v, want closed", last)
+	}
+
+	// A Connect after Disconnect replaces nothing
+	hub.Connect(Config{BaseURL: srv.url, MeetID: "c"})
+	srv.accept(t, time.Second)
+	start = set.get(t, 2).events(t)[0]
+	if start["sequence"] != float64(3) || start["replaces"] != nil {
+		t.Errorf("third start = %v, want sequence 3 and no replaces", start)
+	}
+}
