@@ -102,7 +102,7 @@ type Lifter struct {
 	Flight          *string          `json:"flight"`
 	SquatRackHeight *string          `json:"squatRackHeight"`
 	BenchRackHeight *string          `json:"benchRackHeight"`
-	Platform        *string          `json:"platform"`
+	Platform        *string          `json:"platform"` // a Platform ID, or sometimes the Platform's name; often null
 	Divisions       []LifterDivision `json:"divisions"`
 	Lifts           LifterLifts      `json:"lifts"`
 }
