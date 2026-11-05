@@ -38,6 +38,10 @@ type RecordData struct {
 	Lift            string  `json:"lift"`            // "S" | "B" | "D" | "T"
 	Location        *string `json:"location"`
 	RecordWeight    float64 `json:"recordWeight"`
+	// UpdatedRecordWeight is the new record once the attempt is judged good,
+	// and nil before that. Only the attempt that currently holds the record
+	// carries it; for a total record it is the total, not the attempt weight.
+	UpdatedRecordWeight *float64 `json:"updatedRecordWeight"`
 }
 
 // RefDecisionCards represents referee cards
